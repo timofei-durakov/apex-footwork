@@ -546,8 +546,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 self.bindings.brake = Some(binding);
                 self.step = WizardStep::Ready;
                 self.value_history.clear();
-                self.status =
-                    "Pedal inputs are configured. Press R to configure again.".to_string();
+                self.status = "Pedal inputs are configured. Overlay input is ready.".to_string();
             }
         }
     }
@@ -620,6 +619,253 @@ impl<P: DeviceProvider> Wizard<P> {
         self.value_history.push((throttle, brake));
         if self.value_history.len() > 180 {
             self.value_history.remove(0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{StoredBinding, StoredProfile};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct TestProvider {
+        state: Rc<RefCell<TestProviderState>>,
+    }
+
+    struct TestProviderState {
+        devices: Vec<DeviceSnapshot>,
+        axes: Option<Vec<u32>>,
+    }
+
+    impl TestProvider {
+        fn new(devices: Vec<DeviceSnapshot>, axes: &[u32]) -> Self {
+            Self {
+                state: Rc::new(RefCell::new(TestProviderState {
+                    devices,
+                    axes: Some(axes.to_vec()),
+                })),
+            }
+        }
+
+        fn set_axes(&self, axes: &[u32]) {
+            self.state.borrow_mut().axes = Some(axes.to_vec());
+        }
+
+        fn disconnect(&self) {
+            self.state.borrow_mut().axes = None;
+        }
+    }
+
+    impl DeviceProvider for TestProvider {
+        fn enumerate_devices(&self) -> Vec<DeviceSnapshot> {
+            self.state.borrow().devices.clone()
+        }
+
+        fn read_axes(&self, device_id: u32) -> Option<Vec<u32>> {
+            let state = self.state.borrow();
+            state
+                .devices
+                .iter()
+                .any(|device| device.id == device_id)
+                .then(|| state.axes.clone())
+                .flatten()
+        }
+    }
+
+    fn test_device(id: u32, name: &str, raw: &[u32]) -> DeviceSnapshot {
+        let labels = ["X", "Y", "Z", "R", "U", "V"];
+        DeviceSnapshot {
+            id,
+            name: name.to_string(),
+            axes: raw
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| AxisSnapshot::new(labels[index], 0, 1000, *raw))
+                .collect(),
+        }
+    }
+
+    fn assert_near(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn value_for(values: &[(InputRole, f32)], role: InputRole) -> f32 {
+        values
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == role).then_some(*value))
+            .unwrap()
+    }
+
+    fn profile_for(device_id: u32, device_name: &str) -> StoredProfile {
+        StoredProfile {
+            device_id,
+            device_name: device_name.to_string(),
+            throttle: StoredBinding {
+                axis_index: 0,
+                axis_label: "X".to_string(),
+                idle_raw: 0,
+                active_raw: 1000,
+            },
+            brake: StoredBinding {
+                axis_index: 1,
+                axis_label: "Y".to_string(),
+                idle_raw: 1000,
+                active_raw: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn axis_percent_clamps_and_handles_invalid_range() {
+        assert_near(AxisSnapshot::new("X", 100, 900, 500).percent(), 0.5);
+        assert_near(AxisSnapshot::new("X", 100, 900, 1200).percent(), 1.0);
+        assert_near(AxisSnapshot::new("X", 100, 900, 20).percent(), 0.0);
+        assert_near(AxisSnapshot::new("X", 100, 100, 100).percent(), 0.0);
+    }
+
+    #[test]
+    fn binding_value_supports_reversed_axes() {
+        let binding = BindingView {
+            role: InputRole::Brake,
+            axis_index: 0,
+            axis_label: "Y",
+            idle_raw: 900,
+            active_raw: 100,
+        };
+
+        assert_near(binding.value(&[AxisSnapshot::new("Y", 0, 1000, 500)]), 0.5);
+        assert_near(binding.value(&[AxisSnapshot::new("Y", 0, 1000, 1000)]), 0.0);
+        assert_near(binding.value(&[AxisSnapshot::new("Y", 0, 1000, 0)]), 1.0);
+    }
+
+    #[test]
+    fn wizard_reports_empty_device_list() {
+        let wizard = Wizard::new(TestProvider::new(Vec::new(), &[]));
+        let view = wizard.view();
+
+        assert!(view.status.contains("No joystick/HID devices found"));
+        match view.step {
+            WizardStepView::SelectDevice { devices, .. } => assert!(devices.is_empty()),
+            _ => panic!("expected device selection"),
+        }
+    }
+
+    #[test]
+    fn capture_flow_uses_peak_as_full_scale() {
+        let provider = TestProvider::new(vec![test_device(7, "Test Pedals", &[0, 0])], &[0, 0]);
+        let mut wizard = Wizard::new(provider.clone());
+
+        wizard.handle_command(WizardCommand::Confirm);
+        wizard.handle_command(WizardCommand::Confirm);
+
+        provider.set_axes(&[620, 35]);
+        wizard.update();
+        provider.set_axes(&[0, 0]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[20, 760]);
+        wizard.update();
+        provider.set_axes(&[0, 0]);
+        wizard.update();
+
+        let profile = wizard.profile().unwrap();
+        assert_eq!(profile.throttle.axis_index, 0);
+        assert_eq!(profile.throttle.idle_raw, 0);
+        assert_eq!(profile.throttle.active_raw, 620);
+        assert_eq!(profile.brake.axis_index, 1);
+        assert_eq!(profile.brake.idle_raw, 0);
+        assert_eq!(profile.brake.active_raw, 760);
+
+        provider.set_axes(&[310, 380]);
+        wizard.update();
+
+        match wizard.view().step {
+            WizardStepView::Ready {
+                values, history, ..
+            } => {
+                assert_near(value_for(&values, InputRole::Throttle), 0.5);
+                assert_near(value_for(&values, InputRole::Brake), 0.5);
+                assert_eq!(history.len(), 1);
+                assert_near(history[0].0, 0.5);
+                assert_near(history[0].1, 0.5);
+            }
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn restore_profile_matches_device_by_name_when_id_changes() {
+        let provider =
+            TestProvider::new(vec![test_device(99, "Saved Pedals", &[0, 0])], &[500, 250]);
+        let mut wizard = Wizard::new(provider);
+
+        assert!(wizard.restore_profile(&profile_for(7, "Saved Pedals")));
+
+        match wizard.view().step {
+            WizardStepView::Ready { device, values, .. } => {
+                assert_eq!(device.unwrap().id, 99);
+                assert_near(value_for(&values, InputRole::Throttle), 0.5);
+                assert_near(value_for(&values, InputRole::Brake), 0.75);
+            }
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn restore_profile_rejects_invalid_binding() {
+        let provider = TestProvider::new(vec![test_device(3, "Saved Pedals", &[0, 0])], &[0, 0]);
+        let mut wizard = Wizard::new(provider);
+        let mut profile = profile_for(3, "Saved Pedals");
+        profile.throttle.active_raw = profile.throttle.idle_raw;
+
+        assert!(!wizard.restore_profile(&profile));
+        assert!(wizard.status.contains("throttle binding is invalid"));
+        assert!(matches!(
+            wizard.view().step,
+            WizardStepView::SelectDevice { .. }
+        ));
+    }
+
+    #[test]
+    fn disconnected_device_returns_to_selection_and_clears_profile() {
+        let provider =
+            TestProvider::new(vec![test_device(3, "Saved Pedals", &[0, 0])], &[250, 500]);
+        let mut wizard = Wizard::new(provider.clone());
+
+        assert!(wizard.restore_profile(&profile_for(3, "Saved Pedals")));
+        provider.disconnect();
+        wizard.update();
+
+        assert!(wizard.profile().is_none());
+        assert!(wizard.status.contains("Lost selected device"));
+        assert!(matches!(
+            wizard.view().step,
+            WizardStepView::SelectDevice { .. }
+        ));
+    }
+
+    #[test]
+    fn ready_history_keeps_last_180_samples() {
+        let provider =
+            TestProvider::new(vec![test_device(5, "History Pedals", &[0, 0])], &[0, 1000]);
+        let mut wizard = Wizard::new(provider.clone());
+
+        assert!(wizard.restore_profile(&profile_for(5, "History Pedals")));
+        for index in 0..220 {
+            provider.set_axes(&[(index % 1000) as u32, 1000 - (index % 1000) as u32]);
+            wizard.update();
+        }
+
+        match wizard.view().step {
+            WizardStepView::Ready { history, .. } => assert_eq!(history.len(), 180),
+            _ => panic!("expected ready state"),
         }
     }
 }

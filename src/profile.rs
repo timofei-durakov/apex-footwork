@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredProfile {
     pub device_id: u32,
     pub device_name: String,
@@ -12,7 +12,7 @@ pub struct StoredProfile {
     pub brake: StoredBinding,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredBinding {
     pub axis_index: usize,
     pub axis_label: String,
@@ -121,4 +121,67 @@ fn decode_text(value: &str) -> Option<String> {
         bytes.push(u8::from_str_radix(hex, 16).ok()?);
     }
     String::from_utf8(bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_profile() -> StoredProfile {
+        StoredProfile {
+            device_id: 12,
+            device_name: "Pedals=Alpha\nBeta".to_string(),
+            throttle: StoredBinding {
+                axis_index: 0,
+                axis_label: "X axis".to_string(),
+                idle_raw: 101,
+                active_raw: 801,
+            },
+            brake: StoredBinding {
+                axis_index: 2,
+                axis_label: "Z axis".to_string(),
+                idle_raw: 900,
+                active_raw: 120,
+            },
+        }
+    }
+
+    #[test]
+    fn serialized_profile_roundtrips_special_text() {
+        let profile = sample_profile();
+        let serialized = serialize_profile(&profile);
+
+        assert_eq!(parse_profile(&serialized), Some(profile));
+    }
+
+    #[test]
+    fn profile_signature_matches_serialized_content() {
+        let profile = sample_profile();
+
+        assert_eq!(profile_signature(&profile), serialize_profile(&profile));
+    }
+
+    #[test]
+    fn parser_rejects_unknown_version() {
+        let content = serialize_profile(&sample_profile()).replacen("version=1", "version=2", 1);
+
+        assert_eq!(parse_profile(&content), None);
+    }
+
+    #[test]
+    fn parser_rejects_missing_binding_field() {
+        let content = serialize_profile(&sample_profile())
+            .lines()
+            .filter(|line| !line.starts_with("brake_active_raw="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(parse_profile(&content), None);
+    }
+
+    #[test]
+    fn text_decoder_rejects_invalid_hex() {
+        assert_eq!(decode_text("A"), None);
+        assert_eq!(decode_text("XX"), None);
+    }
 }
