@@ -56,8 +56,10 @@ const WM_LBUTTONDOWN: Uint = 0x0201;
 const WM_MOUSEMOVE: Uint = 0x0200;
 const WM_LBUTTONUP: Uint = 0x0202;
 const WM_SETFONT: Uint = 0x0030;
-const VK_ESCAPE: Wparam = 0x1B;
 const VK_RETURN: Wparam = 0x0D;
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const KEY_O: Wparam = 0x4F;
 const KEY_R: Wparam = 0x52;
 const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
@@ -235,6 +237,7 @@ unsafe extern "system" {
     fn FillRect(hDC: Hdc, lprc: *const Rect, hbr: Hbrush) -> i32;
     fn GetClientRect(hWnd: Hwnd, lpRect: *mut Rect) -> Bool;
     fn GetMessageW(lpMsg: *mut Msg, hWnd: Hwnd, wMsgFilterMin: Uint, wMsgFilterMax: Uint) -> Bool;
+    fn GetKeyState(nVirtKey: i32) -> i16;
     fn InvalidateRect(hWnd: Hwnd, lpRect: *const Rect, bErase: Bool) -> Bool;
     fn LoadCursorW(hInstance: Hinstance, lpCursorName: *const u16) -> Hcursor;
     fn PostQuitMessage(nExitCode: i32);
@@ -537,17 +540,13 @@ unsafe extern "system" fn window_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        WM_KEYDOWN if wparam == VK_ESCAPE => {
-            unsafe { DestroyWindow(hwnd) };
-            0
-        }
         WM_KEYDOWN => {
-            if let Some(command) = command_from_key(wparam) {
-                with_wizard(|wizard| wizard.handle_command(command));
+            if handle_key_down(wparam) {
                 sync_controls();
+                unsafe { InvalidateRect(hwnd, null(), 0) };
+                return 0;
             }
-            unsafe { InvalidateRect(hwnd, null(), 0) };
-            0
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_PAINT => {
             draw(hwnd);
@@ -588,9 +587,12 @@ unsafe extern "system" fn overlay_window_proc(
             }
             0
         }
-        WM_KEYDOWN if wparam == VK_ESCAPE => {
-            unsafe { DestroyWindow(hwnd) };
-            0
+        WM_KEYDOWN => {
+            if handle_shortcut_key(wparam) {
+                sync_controls();
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_PAINT => {
             draw_overlay_window(hwnd);
@@ -703,10 +705,56 @@ fn apply_overlay_window_opacity(hwnd: Hwnd) {
     }
 }
 
+fn handle_key_down(key: Wparam) -> bool {
+    if handle_shortcut_key(key) {
+        return true;
+    }
+
+    if let Some(command) = command_from_key(key) {
+        with_wizard(|wizard| wizard.handle_command(command));
+        return true;
+    }
+
+    false
+}
+
+fn handle_shortcut_key(key: Wparam) -> bool {
+    if !shortcut_modifiers_down() {
+        return false;
+    }
+
+    match key {
+        KEY_O => toggle_overlay_window(),
+        KEY_R => {
+            close_overlay_window();
+            with_wizard(|wizard| wizard.handle_command(WizardCommand::Configure));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn toggle_overlay_window() -> bool {
+    if active_overlay_hwnd().is_some() {
+        close_overlay_window();
+        return true;
+    }
+
+    if !is_ready_view() {
+        return false;
+    }
+
+    start_overlay_window();
+    true
+}
+
+fn shortcut_modifiers_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL) < 0 && GetKeyState(VK_SHIFT) < 0 }
+}
+
 fn command_from_key(key: Wparam) -> Option<WizardCommand> {
     match key {
         VK_RETURN => Some(WizardCommand::Confirm),
-        KEY_R => Some(WizardCommand::Configure),
         _ => None,
     }
 }
@@ -727,6 +775,7 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
     }
 
     if point_in_rect(x, y, configure_button_rect(rect)) {
+        close_overlay_window();
         with_wizard(|wizard| wizard.handle_command(WizardCommand::Configure));
         return true;
     }
@@ -1504,11 +1553,11 @@ fn draw_footer(hdc: Hdc, rect: Rect, ready: bool, overlay_running: bool) {
         color_app_bg(),
     );
     let hint = if ready && overlay_running {
-        "Esc closes  |  Stop closes overlay  |  Configure opens setup"
+        "Ctrl+Shift+O stops overlay  |  Ctrl+Shift+R configure  |  Alt+F4 exits"
     } else if ready {
-        "Esc closes  |  Start opens overlay  |  Configure opens setup"
+        "Ctrl+Shift+O starts overlay  |  Ctrl+Shift+R configure  |  Alt+F4 exits"
     } else {
-        "Esc closes  |  Configure opens setup"
+        "Enter confirms  |  Ctrl+Shift+R configure  |  Alt+F4 exits"
     };
     draw_text_kind(
         hdc,
