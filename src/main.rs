@@ -48,6 +48,7 @@ const WM_CREATE: Uint = 0x0001;
 const WM_DESTROY: Uint = 0x0002;
 const WM_PAINT: Uint = 0x000F;
 const WM_ERASEBKGND: Uint = 0x0014;
+const WM_NCLBUTTONDOWN: Uint = 0x00A1;
 const WM_COMMAND: Uint = 0x0111;
 const WM_TIMER: Uint = 0x0113;
 const WM_KEYDOWN: Uint = 0x0100;
@@ -68,6 +69,7 @@ const DT_VCENTER: Uint = 0x0004;
 const DT_TOP: Uint = 0x0000;
 const DT_SINGLELINE: Uint = 0x0020;
 const WS_CHILD: Dword = 0x4000_0000;
+const WS_POPUP: Dword = 0x8000_0000;
 const WS_TABSTOP: Dword = 0x0001_0000;
 const WS_VSCROLL: Dword = 0x0020_0000;
 const CBS_DROPDOWNLIST: Dword = 0x0003;
@@ -93,6 +95,11 @@ const CLIP_DEFAULT_PRECIS: Dword = 0;
 const CLEARTYPE_QUALITY: Dword = 5;
 const DEFAULT_PITCH: Dword = 0;
 const PS_SOLID: i32 = 0;
+const HTCAPTION: Wparam = 2;
+const WS_EX_TOPMOST: Dword = 0x0000_0008;
+const WS_EX_TOOLWINDOW: Dword = 0x0000_0080;
+const WS_EX_LAYERED: Dword = 0x0008_0000;
+const LWA_ALPHA: Dword = 0x0000_0002;
 
 #[repr(C)]
 struct JoyCapsW {
@@ -234,6 +241,7 @@ unsafe extern "system" {
     fn RegisterClassW(lpWndClass: *const WndClassW) -> u16;
     fn SendMessageW(hWnd: Hwnd, Msg: Uint, wParam: Wparam, lParam: Lparam) -> Lresult;
     fn SetCapture(hWnd: Hwnd) -> Hwnd;
+    fn SetLayeredWindowAttributes(hwnd: Hwnd, crKey: Dword, bAlpha: u8, dwFlags: Dword) -> Bool;
     fn SetTimer(hWnd: Hwnd, nIDEvent: usize, uElapse: Uint, lpTimerFunc: *const c_void) -> usize;
     fn SetWindowTextW(hWnd: Hwnd, lpString: *const u16) -> Bool;
     fn ShowWindow(hWnd: Hwnd, nCmdShow: i32) -> Bool;
@@ -337,6 +345,7 @@ static FONTS: OnceLock<UiFonts> = OnceLock::new();
 static SAVED_PROFILE_SIGNATURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static OVERLAY_SETTINGS: OnceLock<Mutex<OverlaySettings>> = OnceLock::new();
 static RESIZE_DRAG: OnceLock<Mutex<Option<ResizeDrag>>> = OnceLock::new();
+static OVERLAY_HWND: OnceLock<Mutex<Hwnd>> = OnceLock::new();
 
 struct UiFonts {
     title: Hfont,
@@ -395,6 +404,7 @@ impl Default for OverlaySettings {
 fn main() {
     OVERLAY_SETTINGS.get_or_init(|| Mutex::new(OverlaySettings::default()));
     RESIZE_DRAG.get_or_init(|| Mutex::new(None));
+    OVERLAY_HWND.get_or_init(|| Mutex::new(0));
 
     let mut wizard = Wizard::new(WinmmDeviceProvider);
     if let Some(saved_profile) = profile::load_profile() {
@@ -409,6 +419,7 @@ fn main() {
 
 unsafe fn run_window() {
     let class_name = wide("ApexFootworkWindow");
+    let overlay_class_name = wide("ApexFootworkOverlayWindow");
     let title = wide("Apex Footwork setup");
     let h_instance = unsafe { GetModuleHandleW(null()) };
     let cursor = unsafe { LoadCursorW(0, 32512usize as *const u16) };
@@ -427,6 +438,20 @@ unsafe fn run_window() {
     };
 
     unsafe { RegisterClassW(&wc) };
+    let overlay_wc = WndClassW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfn_wnd_proc: Some(overlay_window_proc),
+        cb_cls_extra: 0,
+        cb_wnd_extra: 0,
+        h_instance,
+        h_icon: 0,
+        h_cursor: cursor,
+        hbr_background: 0,
+        lpsz_menu_name: null(),
+        lpsz_class_name: overlay_class_name.as_ptr(),
+    };
+    unsafe { RegisterClassW(&overlay_wc) };
+
     let hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -529,10 +554,152 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_DESTROY => {
+            close_overlay_window();
             unsafe { PostQuitMessage(0) };
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+unsafe extern "system" fn overlay_window_proc(
+    hwnd: Hwnd,
+    msg: Uint,
+    wparam: Wparam,
+    lparam: Lparam,
+) -> Lresult {
+    match msg {
+        WM_CREATE => {
+            unsafe { SetTimer(hwnd, 2, 16, null()) };
+            apply_overlay_window_opacity(hwnd);
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_TIMER => {
+            with_wizard(|wizard| wizard.update());
+            apply_overlay_window_opacity(hwnd);
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+            0
+        }
+        WM_LBUTTONDOWN => {
+            unsafe {
+                ReleaseCapture();
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            }
+            0
+        }
+        WM_KEYDOWN if wparam == VK_ESCAPE => {
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_PAINT => {
+            draw_overlay_window(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            set_overlay_hwnd(0);
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn start_overlay_window() {
+    if !is_ready_view() {
+        return;
+    }
+
+    if let Some(hwnd) = active_overlay_hwnd() {
+        unsafe {
+            apply_overlay_window_opacity(hwnd);
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+        }
+        return;
+    }
+
+    let class_name = wide("ApexFootworkOverlayWindow");
+    let title = wide("Apex Footwork overlay");
+    let h_instance = unsafe { GetModuleHandleW(null()) };
+    let (width, height) = overlay_window_size();
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            220,
+            220,
+            width,
+            height,
+            0,
+            0,
+            h_instance,
+            null_mut(),
+        )
+    };
+
+    if hwnd == 0 {
+        return;
+    }
+
+    set_overlay_hwnd(hwnd);
+    unsafe {
+        apply_overlay_window_opacity(hwnd);
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+    }
+}
+
+fn active_overlay_hwnd() -> Option<Hwnd> {
+    let hwnd = OVERLAY_HWND
+        .get_or_init(|| Mutex::new(0))
+        .lock()
+        .map(|overlay| *overlay)
+        .unwrap_or(0);
+    (hwnd != 0).then_some(hwnd)
+}
+
+fn set_overlay_hwnd(hwnd: Hwnd) {
+    if let Ok(mut overlay) = OVERLAY_HWND.get_or_init(|| Mutex::new(0)).lock() {
+        *overlay = hwnd;
+    }
+}
+
+fn take_overlay_hwnd() -> Hwnd {
+    let Ok(mut overlay) = OVERLAY_HWND.get_or_init(|| Mutex::new(0)).lock() else {
+        return 0;
+    };
+    let hwnd = *overlay;
+    *overlay = 0;
+    hwnd
+}
+
+fn close_overlay_window() {
+    let hwnd = take_overlay_hwnd();
+    if hwnd != 0 {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+    }
+}
+
+fn overlay_window_size() -> (i32, i32) {
+    let settings = overlay_settings();
+    let width = if settings.chart_width <= 0 {
+        520
+    } else {
+        settings.chart_width
+    }
+    .clamp(260, 900);
+    let height = settings.chart_height.clamp(96, 360);
+    (width, height)
+}
+
+fn apply_overlay_window_opacity(hwnd: Hwnd) {
+    let alpha = (overlay_settings().chart_opacity.clamp(0.3, 1.0) * 255.0).round() as u8;
+    unsafe {
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
     }
 }
 
@@ -550,6 +717,15 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
 
     let x = signed_loword(lparam as usize);
     let y = signed_hiword(lparam as usize);
+    if is_ready_view() && point_in_rect(x, y, start_button_rect(rect)) {
+        if active_overlay_hwnd().is_some() {
+            close_overlay_window();
+        } else {
+            start_overlay_window();
+        }
+        return true;
+    }
+
     if point_in_rect(x, y, configure_button_rect(rect)) {
         with_wizard(|wizard| wizard.handle_command(WizardCommand::Configure));
         return true;
@@ -1072,6 +1248,46 @@ fn draw(hwnd: Hwnd) {
     }
 }
 
+fn draw_overlay_window(hwnd: Hwnd) {
+    let mut ps: PaintStruct = unsafe { zeroed() };
+    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+    let mut rect: Rect = unsafe { zeroed() };
+    unsafe { GetClientRect(hwnd, &mut rect) };
+
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        unsafe { EndPaint(hwnd, &ps) };
+        return;
+    }
+
+    let mem_dc = unsafe { CreateCompatibleDC(hdc) };
+    let bitmap = unsafe { CreateCompatibleBitmap(hdc, width, height) };
+    if mem_dc == 0 || bitmap == 0 {
+        draw_overlay_scene(hdc, rect);
+        unsafe {
+            if bitmap != 0 {
+                DeleteObject(bitmap);
+            }
+            if mem_dc != 0 {
+                DeleteDC(mem_dc);
+            }
+            EndPaint(hwnd, &ps);
+        }
+        return;
+    }
+
+    let old_bitmap = unsafe { SelectObject(mem_dc, bitmap) };
+    draw_overlay_scene(mem_dc, rect);
+    unsafe {
+        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        EndPaint(hwnd, &ps);
+    }
+}
+
 fn draw_scene(hdc: Hdc, rect: Rect) {
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
@@ -1083,6 +1299,44 @@ fn draw_scene(hdc: Hdc, rect: Rect) {
 
     if let Some(view) = current_view() {
         draw_view(hdc, &view, rect);
+    }
+}
+
+fn draw_overlay_scene(hdc: Hdc, rect: Rect) {
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, color_text());
+    }
+
+    fill_rect(hdc, rect, color_app_bg());
+
+    let Some(view) = current_view() else {
+        draw_text_kind(
+            hdc,
+            18,
+            18,
+            (rect.right - 36).max(0),
+            22,
+            "Overlay not configured",
+            TextKind::Meta,
+            color_muted(),
+        );
+        return;
+    };
+
+    if let WizardStepView::Ready { history, .. } = &view.step {
+        draw_combined_overlay_chart(hdc, rect, history, 1.0, false);
+    } else {
+        draw_text_kind(
+            hdc,
+            18,
+            18,
+            (rect.right - 36).max(0),
+            22,
+            "Configure pedals first",
+            TextKind::Meta,
+            color_muted(),
+        );
     }
 }
 
@@ -1159,7 +1413,30 @@ fn draw_hud_button(hdc: Hdc, rect: Rect, label: &str, active: bool) {
     } else {
         rgb(74, 84, 102)
     };
+    let text = if active { rgb(6, 18, 20) } else { color_text() };
 
+    draw_hud_button_colored(hdc, rect, label, fill, border, text);
+}
+
+fn draw_hud_button_danger(hdc: Hdc, rect: Rect, label: &str) {
+    draw_hud_button_colored(
+        hdc,
+        rect,
+        label,
+        rgb(47, 31, 39),
+        rgb(255, 82, 96),
+        color_text(),
+    );
+}
+
+fn draw_hud_button_colored(
+    hdc: Hdc,
+    rect: Rect,
+    label: &str,
+    fill: Dword,
+    border: Dword,
+    text: Dword,
+) {
     fill_rect(hdc, rect, fill);
     fill_rect(
         hdc,
@@ -1182,19 +1459,24 @@ fn draw_hud_button(hdc: Hdc, rect: Rect, label: &str, active: bool) {
         border,
     );
 
-    draw_centered_text_kind(
-        hdc,
-        rect,
-        label,
-        TextKind::Body,
-        if active { rgb(6, 18, 20) } else { color_text() },
-    );
+    draw_centered_text_kind(hdc, rect, label, TextKind::Body, text);
 }
 
 fn configure_button_rect(client: Rect) -> Rect {
     let width = 104;
     let right = (client.right - 32).max(width + 32);
     rect_xywh(right - width, 34, width, 34)
+}
+
+fn start_button_rect(client: Rect) -> Rect {
+    let configure = configure_button_rect(client);
+    let width = 82;
+    rect_xywh(
+        (configure.left - width - 12).max(32),
+        configure.top,
+        width,
+        configure.bottom - configure.top,
+    )
 }
 
 fn chart_opacity_minus_rect(_client: Rect) -> Rect {
@@ -1209,7 +1491,7 @@ fn chart_resize_handle_rect(chart: Rect) -> Rect {
     rect_xywh(chart.right - 28, chart.bottom - 28, 22, 22)
 }
 
-fn draw_footer(hdc: Hdc, rect: Rect) {
+fn draw_footer(hdc: Hdc, rect: Rect, ready: bool, overlay_running: bool) {
     let y = (rect.bottom - 34).max(0);
     fill_rect(
         hdc,
@@ -1221,13 +1503,20 @@ fn draw_footer(hdc: Hdc, rect: Rect) {
         },
         color_app_bg(),
     );
+    let hint = if ready && overlay_running {
+        "Esc closes  |  Stop closes overlay  |  Configure opens setup"
+    } else if ready {
+        "Esc closes  |  Start opens overlay  |  Configure opens setup"
+    } else {
+        "Esc closes  |  Configure opens setup"
+    };
     draw_text_kind(
         hdc,
         32,
         y,
         (rect.right - 64).max(0),
         22,
-        "Esc closes  |  Configure opens setup",
+        hint,
         TextKind::Meta,
         color_muted(),
     );
@@ -1252,7 +1541,14 @@ fn rect_xywh(x: i32, y: i32, width: i32, height: i32) -> Rect {
 
 fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
     let configure_rect = configure_button_rect(rect);
-    let header_width = (configure_rect.left - 48).max(220);
+    let ready = matches!(view.step, WizardStepView::Ready { .. });
+    let overlay_running = active_overlay_hwnd().is_some();
+    let header_right = if ready {
+        start_button_rect(rect).left
+    } else {
+        configure_rect.left
+    };
+    let header_width = (header_right - 48).max(220);
     draw_text_kind(
         hdc,
         32,
@@ -1283,6 +1579,14 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
         TextKind::Meta,
         color_accent(),
     );
+    if ready {
+        let action_rect = start_button_rect(rect);
+        if overlay_running {
+            draw_hud_button_danger(hdc, action_rect, "Stop");
+        } else {
+            draw_hud_button(hdc, action_rect, "Start", true);
+        }
+    }
     draw_hud_button(hdc, configure_rect, "Configure", false);
 
     match &view.step {
@@ -1310,7 +1614,7 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
         }
     }
 
-    draw_footer(hdc, rect);
+    draw_footer(hdc, rect, ready, overlay_running);
 }
 
 fn draw_device_picker(hdc: Hdc, devices: &[DeviceSnapshot], _selected_index: usize) {
@@ -1416,7 +1720,7 @@ fn draw_ready(
         rgb(255, 82, 96),
     );
     draw_overlay_controls(hdc, rect, settings, layout.controls_y);
-    draw_combined_overlay_chart(hdc, layout.chart, history, settings.chart_opacity);
+    draw_combined_overlay_chart(hdc, layout.chart, history, settings.chart_opacity, true);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
@@ -1502,7 +1806,13 @@ fn visible_chart_width(client: Rect, settings: OverlaySettings) -> i32 {
     desired_width.clamp(260, content_width)
 }
 
-fn draw_combined_overlay_chart(hdc: Hdc, chart: Rect, history: &[(f32, f32)], opacity: f32) {
+fn draw_combined_overlay_chart(
+    hdc: Hdc,
+    chart: Rect,
+    history: &[(f32, f32)],
+    opacity: f32,
+    show_grip: bool,
+) {
     let x = chart.left;
     let y = chart.top;
     let width = chart.right - chart.left;
@@ -1521,7 +1831,9 @@ fn draw_combined_overlay_chart(hdc: Hdc, chart: Rect, history: &[(f32, f32)], op
     if width >= 420 {
         draw_legend(hdc, x + 14, y + 12, opacity);
     }
-    draw_resize_grip(hdc, chart, opacity);
+    if show_grip {
+        draw_resize_grip(hdc, chart, opacity);
+    }
 
     let top_padding = if width >= 420 { 42 } else { 18 };
     let plot = rect_xywh(
