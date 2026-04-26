@@ -16,6 +16,8 @@ type Dword = u32;
 type Hbrush = isize;
 type Hcursor = isize;
 type Hdc = isize;
+type Hfont = isize;
+type Hgdiobj = isize;
 type Hinstance = isize;
 type Hwnd = isize;
 type Lparam = isize;
@@ -44,9 +46,11 @@ const JOY_RETURNALL: Dword = JOY_RETURNX
 const WM_CREATE: Uint = 0x0001;
 const WM_DESTROY: Uint = 0x0002;
 const WM_PAINT: Uint = 0x000F;
+const WM_ERASEBKGND: Uint = 0x0014;
 const WM_COMMAND: Uint = 0x0111;
 const WM_TIMER: Uint = 0x0113;
 const WM_KEYDOWN: Uint = 0x0100;
+const WM_SETFONT: Uint = 0x0030;
 const VK_ESCAPE: Wparam = 0x1B;
 const VK_RETURN: Wparam = 0x0D;
 const KEY_R: Wparam = 0x52;
@@ -54,7 +58,6 @@ const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
 const CS_HREDRAW: Uint = 0x0002;
 const CS_VREDRAW: Uint = 0x0001;
-const COLOR_WINDOW: isize = 5;
 const DT_LEFT: Uint = 0x0000;
 const DT_TOP: Uint = 0x0000;
 const DT_SINGLELINE: Uint = 0x0020;
@@ -64,6 +67,8 @@ const WS_VSCROLL: Dword = 0x0020_0000;
 const CBS_DROPDOWNLIST: Dword = 0x0003;
 const BS_DEFPUSHBUTTON: Dword = 0x0001;
 const BS_PUSHBUTTON: Dword = 0x0000;
+const WS_CLIPCHILDREN: Dword = 0x0200_0000;
+const WS_CLIPSIBLINGS: Dword = 0x0400_0000;
 const CBN_SELCHANGE: u16 = 1;
 const BN_CLICKED: u16 = 0;
 const CB_ADDSTRING: Uint = 0x0143;
@@ -74,6 +79,16 @@ const CB_ERR: Lresult = -1;
 const IDC_DEVICE_COMBO: u16 = 1001;
 const IDC_PRIMARY_BUTTON: u16 = 1002;
 const IDC_RESTART_BUTTON: u16 = 1003;
+const SRCCOPY: Dword = 0x00CC_0020;
+const TRANSPARENT: i32 = 1;
+const FW_NORMAL: i32 = 400;
+const FW_SEMIBOLD: i32 = 600;
+const DEFAULT_CHARSET: Dword = 1;
+const OUT_DEFAULT_PRECIS: Dword = 0;
+const CLIP_DEFAULT_PRECIS: Dword = 0;
+const CLEARTYPE_QUALITY: Dword = 5;
+const DEFAULT_PITCH: Dword = 0;
+const PS_SOLID: i32 = 0;
 
 #[repr(C)]
 struct JoyCapsW {
@@ -223,10 +238,49 @@ unsafe extern "system" {
 
 #[link(name = "gdi32")]
 unsafe extern "system" {
+    fn BitBlt(
+        hdc: Hdc,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        hdcSrc: Hdc,
+        x1: i32,
+        y1: i32,
+        rop: Dword,
+    ) -> Bool;
+    fn CreateCompatibleBitmap(hdc: Hdc, cx: i32, cy: i32) -> Hgdiobj;
+    fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
+    fn CreateFontW(
+        cHeight: i32,
+        cWidth: i32,
+        cEscapement: i32,
+        cOrientation: i32,
+        cWeight: i32,
+        bItalic: Dword,
+        bUnderline: Dword,
+        bStrikeOut: Dword,
+        iCharSet: Dword,
+        iOutPrecision: Dword,
+        iClipPrecision: Dword,
+        iQuality: Dword,
+        iPitchAndFamily: Dword,
+        pszFaceName: *const u16,
+    ) -> Hfont;
+    fn CreatePen(iStyle: i32, cWidth: i32, color: Dword) -> Hgdiobj;
     fn CreateSolidBrush(color: Dword) -> Hbrush;
+    fn DeleteDC(hdc: Hdc) -> Bool;
     fn DeleteObject(ho: isize) -> Bool;
+    fn LineTo(hdc: Hdc, x: i32, y: i32) -> Bool;
+    fn MoveToEx(hdc: Hdc, x: i32, y: i32, lppt: *mut Point) -> Bool;
+    fn SelectObject(hdc: Hdc, h: Hgdiobj) -> Hgdiobj;
     fn SetBkMode(hdc: Hdc, mode: i32) -> i32;
     fn SetTextColor(hdc: Hdc, color: Dword) -> Dword;
+}
+
+#[link(name = "uxtheme")]
+unsafe extern "system" {
+    fn SetWindowTheme(hwnd: Hwnd, pszSubAppName: *const u16, pszSubIdList: *const u16) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -273,6 +327,14 @@ impl DeviceProvider for WinmmDeviceProvider {
 
 static STATE: OnceLock<Mutex<Wizard<WinmmDeviceProvider>>> = OnceLock::new();
 static CONTROLS: OnceLock<Mutex<UiControls>> = OnceLock::new();
+static FONTS: OnceLock<UiFonts> = OnceLock::new();
+
+struct UiFonts {
+    title: Hfont,
+    heading: Hfont,
+    body: Hfont,
+    meta: Hfont,
+}
 
 struct UiControls {
     device_combo: Hwnd,
@@ -306,7 +368,7 @@ unsafe fn run_window() {
         h_instance,
         h_icon: 0,
         h_cursor: cursor,
-        hbr_background: COLOR_WINDOW + 1,
+        hbr_background: 0,
         lpsz_menu_name: null(),
         lpsz_class_name: class_name.as_ptr(),
     };
@@ -317,7 +379,7 @@ unsafe fn run_window() {
             0,
             class_name.as_ptr(),
             title.as_ptr(),
-            0x10CF_0000,
+            0x10CF_0000 | WS_CLIPCHILDREN,
             100,
             100,
             780,
@@ -359,16 +421,17 @@ unsafe extern "system" fn window_proc(
             create_controls(hwnd);
             0
         }
+        WM_ERASEBKGND => 1,
         WM_TIMER => {
             with_wizard(|wizard| wizard.update());
             sync_controls();
-            unsafe { InvalidateRect(hwnd, null(), 1) };
+            unsafe { InvalidateRect(hwnd, null(), 0) };
             0
         }
         WM_COMMAND => {
             handle_control_command(wparam, lparam);
             sync_controls();
-            unsafe { InvalidateRect(hwnd, null(), 1) };
+            unsafe { InvalidateRect(hwnd, null(), 0) };
             0
         }
         WM_KEYDOWN if wparam == VK_ESCAPE => {
@@ -380,7 +443,7 @@ unsafe extern "system" fn window_proc(
                 with_wizard(|wizard| wizard.handle_command(command));
                 sync_controls();
             }
-            unsafe { InvalidateRect(hwnd, null(), 1) };
+            unsafe { InvalidateRect(hwnd, null(), 0) };
             0
         }
         WM_PAINT => {
@@ -412,6 +475,7 @@ fn with_wizard(action: impl FnOnce(&mut Wizard<WinmmDeviceProvider>)) {
 }
 
 fn create_controls(parent: Hwnd) {
+    init_fonts();
     let h_instance = unsafe { GetModuleHandleW(null()) };
     let combo_class = wide("COMBOBOX");
     let button_class = wide("BUTTON");
@@ -423,11 +487,11 @@ fn create_controls(parent: Hwnd) {
             0,
             combo_class.as_ptr(),
             null(),
-            WS_CHILD | WS_VSCROLL | CBS_DROPDOWNLIST,
-            24,
-            150,
+            WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL | CBS_DROPDOWNLIST,
+            32,
+            154,
             520,
-            180,
+            220,
             parent,
             IDC_DEVICE_COMBO as isize,
             h_instance,
@@ -439,11 +503,11 @@ fn create_controls(parent: Hwnd) {
             0,
             button_class.as_ptr(),
             use_device.as_ptr(),
-            WS_CHILD | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            560,
-            149,
-            118,
-            28,
+            WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            568,
+            153,
+            124,
+            30,
             parent,
             IDC_PRIMARY_BUTTON as isize,
             h_instance,
@@ -455,11 +519,11 @@ fn create_controls(parent: Hwnd) {
             0,
             button_class.as_ptr(),
             restart.as_ptr(),
-            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            688,
-            149,
-            68,
-            28,
+            WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON,
+            672,
+            34,
+            84,
+            30,
             parent,
             IDC_RESTART_BUTTON as isize,
             h_instance,
@@ -480,7 +544,58 @@ fn create_controls(parent: Hwnd) {
         restart_visible: false,
     }));
 
+    apply_control_style(device_combo);
+    apply_control_style(primary_button);
+    apply_control_style(restart_button);
     sync_controls();
+}
+
+fn init_fonts() {
+    let _ = FONTS.set(UiFonts {
+        title: create_ui_font(-26, FW_SEMIBOLD),
+        heading: create_ui_font(-18, FW_SEMIBOLD),
+        body: create_ui_font(-15, FW_NORMAL),
+        meta: create_ui_font(-13, FW_NORMAL),
+    });
+}
+
+fn create_ui_font(height: i32, weight: i32) -> Hfont {
+    let face = wide("Segoe UI");
+    unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH,
+            face.as_ptr(),
+        )
+    }
+}
+
+fn apply_control_style(hwnd: Hwnd) {
+    if hwnd == 0 {
+        return;
+    }
+
+    if let Some(fonts) = FONTS.get() {
+        unsafe {
+            SendMessageW(hwnd, WM_SETFONT, fonts.body as Wparam, 1);
+        }
+    }
+
+    let explorer = wide("Explorer");
+    unsafe {
+        SetWindowTheme(hwnd, explorer.as_ptr(), null());
+    }
 }
 
 fn handle_control_command(wparam: Wparam, lparam: Lparam) {
@@ -692,24 +807,55 @@ fn read_axis_values(device_id: u32) -> Option<[u32; 6]> {
 fn draw(hwnd: Hwnd) {
     let mut ps: PaintStruct = unsafe { zeroed() };
     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-    unsafe {
-        SetBkMode(hdc, 1);
-        SetTextColor(hdc, rgb(28, 31, 35));
-    }
-
     let mut rect: Rect = unsafe { zeroed() };
     unsafe { GetClientRect(hwnd, &mut rect) };
-    let bg = unsafe { CreateSolidBrush(rgb(246, 247, 249)) };
-    unsafe {
-        FillRect(hdc, &rect, bg);
-        DeleteObject(bg);
+
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        unsafe { EndPaint(hwnd, &ps) };
+        return;
     }
+
+    let mem_dc = unsafe { CreateCompatibleDC(hdc) };
+    let bitmap = unsafe { CreateCompatibleBitmap(hdc, width, height) };
+    if mem_dc == 0 || bitmap == 0 {
+        draw_scene(hdc, rect);
+        unsafe {
+            if bitmap != 0 {
+                DeleteObject(bitmap);
+            }
+            if mem_dc != 0 {
+                DeleteDC(mem_dc);
+            }
+            EndPaint(hwnd, &ps);
+        }
+        return;
+    }
+
+    let old_bitmap = unsafe { SelectObject(mem_dc, bitmap) };
+    draw_scene(mem_dc, rect);
+    unsafe {
+        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+fn draw_scene(hdc: Hdc, rect: Rect) {
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, color_text());
+    }
+
+    fill_rect(hdc, rect, color_app_bg());
+    draw_shell(hdc, rect);
 
     if let Some(view) = current_view() {
         draw_view(hdc, &view, rect);
     }
-
-    unsafe { EndPaint(hwnd, &ps) };
 }
 
 fn current_view() -> Option<WizardView> {
@@ -718,10 +864,98 @@ fn current_view() -> Option<WizardView> {
     Some(wizard.view())
 }
 
+#[derive(Clone, Copy)]
+enum TextKind {
+    Title,
+    Heading,
+    Body,
+    Meta,
+}
+
+fn draw_shell(hdc: Hdc, rect: Rect) {
+    fill_rect(hdc, rect, color_app_bg());
+    fill_rect(
+        hdc,
+        Rect {
+            left: 0,
+            top: 0,
+            right: rect.right,
+            bottom: 4,
+        },
+        color_accent(),
+    );
+
+    draw_panel(hdc, 16, 16, (rect.right - 32).max(0), 88, color_panel());
+    draw_panel(
+        hdc,
+        16,
+        118,
+        (rect.right - 32).max(0),
+        (rect.bottom - 166).max(0),
+        color_panel(),
+    );
+}
+
+fn draw_panel(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, color: Dword) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    fill_rect(hdc, rect_xywh(x, y, width, height), color);
+    fill_rect(hdc, rect_xywh(x, y, width, 1), color_border());
+    fill_rect(hdc, rect_xywh(x, y + height - 1, width, 1), color_border());
+    fill_rect(hdc, rect_xywh(x, y, 1, height), color_border());
+    fill_rect(hdc, rect_xywh(x + width - 1, y, 1, height), color_border());
+}
+
+fn fill_rect(hdc: Hdc, rect: Rect, color: Dword) {
+    let brush = unsafe { CreateSolidBrush(color) };
+    unsafe {
+        FillRect(hdc, &rect, brush);
+        DeleteObject(brush);
+    }
+}
+
+fn rect_xywh(x: i32, y: i32, width: i32, height: i32) -> Rect {
+    Rect {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    }
+}
+
 fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
-    draw_text(hdc, 24, 20, 720, 28, "Apex Footwork setup wizard");
-    draw_text(hdc, 24, 52, 720, 24, &view.status);
-    draw_text(hdc, 24, 78, 720, 22, view.step.title());
+    draw_text_kind(
+        hdc,
+        32,
+        26,
+        720,
+        32,
+        "Apex Footwork",
+        TextKind::Title,
+        color_text(),
+    );
+    draw_text_kind(
+        hdc,
+        32,
+        60,
+        720,
+        22,
+        &view.status,
+        TextKind::Body,
+        color_muted(),
+    );
+    draw_text_kind(
+        hdc,
+        32,
+        84,
+        720,
+        20,
+        view.step.title(),
+        TextKind::Meta,
+        color_accent(),
+    );
 
     match &view.step {
         WizardStepView::SelectDevice {
@@ -742,8 +976,9 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
             device,
             bindings,
             values,
+            history,
         } => {
-            draw_ready(hdc, device, bindings, values);
+            draw_ready(hdc, device, bindings, values, history);
         }
     }
 
@@ -787,7 +1022,7 @@ fn draw_capture_step(
 
     let instruction = if armed {
         format!(
-            "Press {} fully now. The moving axis will be detected.",
+            "Press {} fully, then release it. The highest point becomes 100%.",
             role.label()
         )
     } else {
@@ -796,12 +1031,14 @@ fn draw_capture_step(
     draw_text(hdc, 24, 150, 520, 22, &instruction);
 
     if let Some(device) = device {
+        draw_panel(hdc, 24, 184, 574, 262, color_panel_raised());
         for (i, axis) in device.axes.iter().enumerate() {
-            draw_axis(hdc, 24, 194 + (i as i32 * 42), 560, axis);
+            draw_axis(hdc, 38, 200 + (i as i32 * 38), 532, axis);
         }
     }
 
-    draw_binding_summary(hdc, bindings, 610, 194);
+    draw_panel(hdc, 612, 184, 142, 104, color_panel_raised());
+    draw_binding_summary(hdc, bindings, 626, 198);
 }
 
 fn draw_ready(
@@ -809,6 +1046,7 @@ fn draw_ready(
     device: &Option<DeviceSnapshot>,
     bindings: &PedalBindings,
     values: &[(InputRole, f32)],
+    history: &[(f32, f32)],
 ) {
     let device_name = device
         .as_ref()
@@ -825,21 +1063,50 @@ fn draw_ready(
         .find_map(|(role, value)| (*role == InputRole::Brake).then_some(*value))
         .unwrap_or(0.0);
 
-    draw_value_bar(hdc, 24, 176, 620, "Throttle", throttle, rgb(19, 132, 109));
-    draw_value_bar(hdc, 24, 238, 620, "Brake", brake, rgb(180, 47, 54));
+    draw_value_bar(hdc, 24, 166, 332, "Throttle", throttle, color_accent());
+    draw_value_bar(hdc, 384, 166, 332, "Brake", brake, rgb(255, 82, 96));
+    draw_overlay_chart(
+        hdc,
+        24,
+        314,
+        336,
+        118,
+        "Throttle trace",
+        history,
+        InputRole::Throttle,
+    );
+    draw_overlay_chart(
+        hdc,
+        384,
+        314,
+        336,
+        118,
+        "Brake trace",
+        history,
+        InputRole::Brake,
+    );
     draw_text(
         hdc,
         24,
-        316,
+        450,
         720,
         22,
         "Live normalized pedal values are ready for the overlay layer.",
     );
-    draw_binding_summary(hdc, bindings, 24, 354);
+    draw_binding_summary(hdc, bindings, 24, 478);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
-    draw_text(hdc, x, y, 150, 22, "Bindings");
+    draw_text_kind(
+        hdc,
+        x,
+        y,
+        150,
+        22,
+        "Bindings",
+        TextKind::Heading,
+        color_text(),
+    );
     draw_binding_line(
         hdc,
         x,
@@ -850,7 +1117,104 @@ fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
     draw_binding_line(hdc, x, y + 58, InputRole::Brake, bindings.brake.as_ref());
 }
 
+fn draw_overlay_chart(
+    hdc: Hdc,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    label: &str,
+    history: &[(f32, f32)],
+    role: InputRole,
+) {
+    draw_panel(hdc, x, y, width, height, color_panel_raised());
+    draw_text_kind(
+        hdc,
+        x + 14,
+        y + 10,
+        width - 28,
+        20,
+        label,
+        TextKind::Heading,
+        color_text(),
+    );
+
+    let plot = rect_xywh(x + 14, y + 38, width - 28, height - 54);
+    for i in 0..=3 {
+        let grid_y = plot.top + ((plot.bottom - plot.top) * i / 3);
+        fill_rect(
+            hdc,
+            Rect {
+                left: plot.left,
+                top: grid_y,
+                right: plot.right,
+                bottom: grid_y + 1,
+            },
+            rgb(40, 46, 57),
+        );
+    }
+
+    if history.len() < 2 {
+        draw_text_kind(
+            hdc,
+            plot.left,
+            plot.top + 16,
+            plot.right - plot.left,
+            20,
+            "Waiting for input",
+            TextKind::Meta,
+            color_muted(),
+        );
+        return;
+    }
+
+    let color = match role {
+        InputRole::Throttle => color_accent(),
+        InputRole::Brake => rgb(255, 82, 96),
+    };
+    draw_history_line(hdc, plot, history, role, color);
+}
+
+fn draw_history_line(hdc: Hdc, plot: Rect, history: &[(f32, f32)], role: InputRole, color: Dword) {
+    let plot_width = (plot.right - plot.left).max(1) as usize;
+    let start = history.len().saturating_sub(plot_width);
+    let visible = &history[start..];
+    if visible.len() < 2 {
+        return;
+    }
+
+    let pen = unsafe { CreatePen(PS_SOLID, 2, color) };
+    let old_pen = unsafe { SelectObject(hdc, pen) };
+    let span_x = (plot.right - plot.left - 1).max(1) as f32;
+    let span_y = (plot.bottom - plot.top - 1).max(1) as f32;
+
+    for (index, sample) in visible.iter().enumerate() {
+        let value = match role {
+            InputRole::Throttle => sample.0,
+            InputRole::Brake => sample.1,
+        }
+        .clamp(0.0, 1.0);
+
+        let x = plot.left + ((index as f32 / (visible.len() - 1) as f32) * span_x).round() as i32;
+        let y = plot.bottom - 1 - (value * span_y).round() as i32;
+
+        unsafe {
+            if index == 0 {
+                MoveToEx(hdc, x, y, null_mut());
+            } else {
+                LineTo(hdc, x, y);
+            }
+        }
+    }
+
+    unsafe {
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen);
+    }
+}
+
 fn draw_binding_line(hdc: Hdc, x: i32, y: i32, role: InputRole, binding: Option<&BindingView>) {
+    let width = if x > 600 { 112 } else { 520 };
     let text = if let Some(binding) = binding {
         format!(
             "{}: {} idle={} active={}",
@@ -862,20 +1226,30 @@ fn draw_binding_line(hdc: Hdc, x: i32, y: i32, role: InputRole, binding: Option<
     } else {
         format!("{}: not set", role.label())
     };
-    draw_text(hdc, x, y, 520, 22, &text);
+    draw_text_kind(hdc, x, y, width, 22, &text, TextKind::Meta, color_muted());
 }
 
 fn draw_axis(hdc: Hdc, x: i32, y: i32, width: i32, axis: &AxisSnapshot) {
     let percent = axis.percent();
     let label = format!("{}  raw={}  {:.0}%", axis.label, axis.raw, percent * 100.0);
-    draw_text(hdc, x, y, width, 18, &label);
-    draw_bar(hdc, x, y + 20, width, 14, percent, rgb(19, 132, 109));
+    draw_text_kind(hdc, x, y, width, 18, &label, TextKind::Meta, color_muted());
+    draw_bar(hdc, x, y + 20, width, 12, percent, color_accent());
 }
 
 fn draw_value_bar(hdc: Hdc, x: i32, y: i32, width: i32, label: &str, value: f32, color: Dword) {
+    draw_panel(hdc, x, y, width, 94, color_panel_raised());
     let text = format!("{}  {:.0}%", label, value * 100.0);
-    draw_text(hdc, x, y, width, 22, &text);
-    draw_bar(hdc, x, y + 28, width, 22, value, color);
+    draw_text_kind(
+        hdc,
+        x + 14,
+        y + 12,
+        width - 28,
+        24,
+        &text,
+        TextKind::Heading,
+        color_text(),
+    );
+    draw_bar(hdc, x + 14, y + 52, width - 28, 18, value, color);
 }
 
 fn draw_bar(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, percent: f32, fill_color: Dword) {
@@ -893,7 +1267,7 @@ fn draw_bar(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, percent: f32, fil
         bottom: y + height,
     };
 
-    let empty_brush = unsafe { CreateSolidBrush(rgb(222, 226, 231)) };
+    let empty_brush = unsafe { CreateSolidBrush(color_track()) };
     let fill_brush = unsafe { CreateSolidBrush(fill_color) };
     unsafe {
         FillRect(hdc, &bar, empty_brush);
@@ -904,6 +1278,19 @@ fn draw_bar(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, percent: f32, fil
 }
 
 fn draw_text(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, text: &str) {
+    draw_text_kind(hdc, x, y, width, height, text, TextKind::Body, color_text());
+}
+
+fn draw_text_kind(
+    hdc: Hdc,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    text: &str,
+    kind: TextKind,
+    color: Dword,
+) {
     let mut rect = Rect {
         left: x,
         top: y,
@@ -911,7 +1298,9 @@ fn draw_text(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, text: &str) {
         bottom: y + height,
     };
     let wide_text = wide(text);
+    let old_font = select_text_font(hdc, kind);
     unsafe {
+        SetTextColor(hdc, color);
         DrawTextW(
             hdc,
             wide_text.as_ptr(),
@@ -919,7 +1308,55 @@ fn draw_text(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, text: &str) {
             &mut rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE,
         );
+        if old_font != 0 {
+            SelectObject(hdc, old_font);
+        }
     }
+}
+
+fn select_text_font(hdc: Hdc, kind: TextKind) -> Hgdiobj {
+    let Some(fonts) = FONTS.get() else {
+        return 0;
+    };
+    let font = match kind {
+        TextKind::Title => fonts.title,
+        TextKind::Heading => fonts.heading,
+        TextKind::Body => fonts.body,
+        TextKind::Meta => fonts.meta,
+    };
+    unsafe { SelectObject(hdc, font as Hgdiobj) }
+}
+
+fn color_app_bg() -> Dword {
+    rgb(14, 16, 20)
+}
+
+fn color_panel() -> Dword {
+    rgb(24, 27, 34)
+}
+
+fn color_panel_raised() -> Dword {
+    rgb(31, 35, 44)
+}
+
+fn color_border() -> Dword {
+    rgb(48, 55, 68)
+}
+
+fn color_text() -> Dword {
+    rgb(236, 240, 247)
+}
+
+fn color_muted() -> Dword {
+    rgb(150, 160, 174)
+}
+
+fn color_accent() -> Dword {
+    rgb(0, 210, 183)
+}
+
+fn color_track() -> Dword {
+    rgb(48, 55, 66)
 }
 
 fn name_from_wide(chars: &[u16]) -> String {

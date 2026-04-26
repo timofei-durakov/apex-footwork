@@ -116,6 +116,7 @@ pub enum WizardStepView {
         device: Option<DeviceSnapshot>,
         bindings: PedalBindings,
         values: Vec<(InputRole, f32)>,
+        history: Vec<(f32, f32)>,
     },
 }
 
@@ -142,15 +143,31 @@ pub struct WizardView {
     pub step: WizardStepView,
 }
 
+#[derive(Clone, Debug)]
+struct CaptureCandidate {
+    binding: BindingView,
+    magnitude: f32,
+}
+
+enum CaptureUpdate {
+    Waiting,
+    Candidate(CaptureCandidate),
+    Finished(BindingView),
+}
+
 enum WizardStep {
     SelectDevice,
     Capture {
         role: InputRole,
         armed: bool,
         baseline: Vec<u32>,
+        candidate: Option<CaptureCandidate>,
     },
     Ready,
 }
+
+const CAPTURE_START_THRESHOLD: f32 = 0.18;
+const CAPTURE_RELEASE_THRESHOLD: f32 = 0.06;
 
 pub struct Wizard<P: DeviceProvider> {
     provider: P,
@@ -159,6 +176,7 @@ pub struct Wizard<P: DeviceProvider> {
     active_device: Option<DeviceSnapshot>,
     step: WizardStep,
     bindings: PedalBindings,
+    value_history: Vec<(f32, f32)>,
     status: String,
     tick: u32,
 }
@@ -179,6 +197,7 @@ impl<P: DeviceProvider> Wizard<P> {
             active_device: None,
             step: WizardStep::SelectDevice,
             bindings: PedalBindings::default(),
+            value_history: Vec::new(),
             status,
             tick: 0,
         }
@@ -195,16 +214,38 @@ impl<P: DeviceProvider> Wizard<P> {
             self.poll_active_device();
         }
 
+        if matches!(self.step, WizardStep::Ready) {
+            self.record_live_values();
+        }
+
         if let WizardStep::Capture {
             role,
             armed: true,
             baseline,
+            candidate,
         } = &self.step
         {
             let role = *role;
             let baseline = baseline.clone();
-            if let Some(binding) = self.detect_binding(role, &baseline) {
-                self.finish_binding(binding);
+            let candidate = candidate.clone();
+
+            match self.update_capture(role, &baseline, candidate.as_ref()) {
+                CaptureUpdate::Waiting => {}
+                CaptureUpdate::Candidate(candidate) => {
+                    if let WizardStep::Capture {
+                        candidate: current, ..
+                    } = &mut self.step
+                    {
+                        *current = Some(candidate);
+                    }
+                    self.status = format!(
+                        "{} movement detected. Release the pedal to save the full press.",
+                        role.label()
+                    );
+                }
+                CaptureUpdate::Finished(binding) => {
+                    self.finish_binding(binding);
+                }
             }
         }
     }
@@ -238,6 +279,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 device: self.active_device.clone(),
                 bindings: self.bindings.clone(),
                 values: self.live_values(),
+                history: self.value_history.clone(),
             },
         };
 
@@ -268,6 +310,7 @@ impl<P: DeviceProvider> Wizard<P> {
     fn restart(&mut self) {
         self.active_device = None;
         self.bindings = PedalBindings::default();
+        self.value_history.clear();
         self.step = WizardStep::SelectDevice;
         self.refresh_devices();
     }
@@ -316,10 +359,12 @@ impl<P: DeviceProvider> Wizard<P> {
         self.active_device = Some(device);
         self.poll_active_device();
         self.bindings = PedalBindings::default();
+        self.value_history.clear();
         self.step = WizardStep::Capture {
             role: InputRole::Throttle,
             armed: false,
             baseline: Vec::new(),
+            candidate: None,
         };
         self.status = "Release all pedals, then click Capture throttle.".to_string();
     }
@@ -337,15 +382,49 @@ impl<P: DeviceProvider> Wizard<P> {
                 role,
                 armed: true,
                 baseline,
+                candidate: None,
             };
             self.status = format!(
-                "Press {} fully now. The moving axis will be detected.",
+                "Press {} fully, then release it. The peak will become 100%.",
                 role.label()
             );
         }
     }
 
-    fn detect_binding(&self, role: InputRole, baseline: &[u32]) -> Option<BindingView> {
+    fn update_capture(
+        &self,
+        role: InputRole,
+        baseline: &[u32],
+        candidate: Option<&CaptureCandidate>,
+    ) -> CaptureUpdate {
+        let Some((binding, magnitude)) = self.detect_binding(role, baseline) else {
+            return if let Some(candidate) = candidate {
+                if self.current_release_magnitude(candidate.binding.axis_index, baseline)
+                    <= CAPTURE_RELEASE_THRESHOLD
+                {
+                    CaptureUpdate::Finished(candidate.binding.clone())
+                } else {
+                    CaptureUpdate::Candidate(candidate.clone())
+                }
+            } else {
+                CaptureUpdate::Waiting
+            };
+        };
+
+        if let Some(candidate) = candidate {
+            if magnitude <= CAPTURE_RELEASE_THRESHOLD {
+                return CaptureUpdate::Finished(candidate.binding.clone());
+            }
+
+            if magnitude <= candidate.magnitude {
+                return CaptureUpdate::Candidate(candidate.clone());
+            }
+        }
+
+        CaptureUpdate::Candidate(CaptureCandidate { binding, magnitude })
+    }
+
+    fn detect_binding(&self, role: InputRole, baseline: &[u32]) -> Option<(BindingView, f32)> {
         let device = self.active_device.as_ref()?;
         let mut best: Option<(usize, f32)> = None;
 
@@ -363,18 +442,36 @@ impl<P: DeviceProvider> Wizard<P> {
         }
 
         let (axis_index, magnitude) = best?;
-        if magnitude < 0.18 {
+        if magnitude < CAPTURE_START_THRESHOLD {
             return None;
         }
 
         let axis = &device.axes[axis_index];
-        Some(BindingView {
-            role,
-            axis_index,
-            axis_label: axis.label,
-            idle_raw: baseline[axis_index],
-            active_raw: axis.raw,
-        })
+        Some((
+            BindingView {
+                role,
+                axis_index,
+                axis_label: axis.label,
+                idle_raw: baseline[axis_index],
+                active_raw: axis.raw,
+            },
+            magnitude,
+        ))
+    }
+
+    fn current_release_magnitude(&self, axis_index: usize, baseline: &[u32]) -> f32 {
+        let Some(device) = self.active_device.as_ref() else {
+            return 0.0;
+        };
+        let Some(axis) = device.axes.get(axis_index) else {
+            return 0.0;
+        };
+        let Some(&idle_raw) = baseline.get(axis_index) else {
+            return 0.0;
+        };
+
+        let range = axis.max.saturating_sub(axis.min).max(1) as f32;
+        (axis.raw as f32 - idle_raw as f32).abs() / range
     }
 
     fn finish_binding(&mut self, binding: BindingView) {
@@ -385,6 +482,7 @@ impl<P: DeviceProvider> Wizard<P> {
                     role: InputRole::Brake,
                     armed: false,
                     baseline: Vec::new(),
+                    candidate: None,
                 };
                 self.status =
                     "Throttle detected. Release all pedals, then click Capture brake.".to_string();
@@ -392,6 +490,7 @@ impl<P: DeviceProvider> Wizard<P> {
             InputRole::Brake => {
                 self.bindings.brake = Some(binding);
                 self.step = WizardStep::Ready;
+                self.value_history.clear();
                 self.status =
                     "Pedal inputs are configured. Press R to run the wizard again.".to_string();
             }
@@ -411,5 +510,22 @@ impl<P: DeviceProvider> Wizard<P> {
             values.push((InputRole::Brake, binding.value(&device.axes)));
         }
         values
+    }
+
+    fn record_live_values(&mut self) {
+        let values = self.live_values();
+        let throttle = values
+            .iter()
+            .find_map(|(role, value)| (*role == InputRole::Throttle).then_some(*value))
+            .unwrap_or(0.0);
+        let brake = values
+            .iter()
+            .find_map(|(role, value)| (*role == InputRole::Brake).then_some(*value))
+            .unwrap_or(0.0);
+
+        self.value_history.push((throttle, brake));
+        if self.value_history.len() > 180 {
+            self.value_history.remove(0);
+        }
     }
 }
