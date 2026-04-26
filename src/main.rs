@@ -1,9 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod wizard;
+
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
+use wizard::{
+    AxisSnapshot, BindingView, DeviceProvider, DeviceSnapshot, InputRole, PedalBindings, Wizard,
+    WizardCommand, WizardStepView, WizardView,
+};
 
 type Bool = i32;
 type Dword = u32;
@@ -38,9 +44,13 @@ const JOY_RETURNALL: Dword = JOY_RETURNX
 const WM_CREATE: Uint = 0x0001;
 const WM_DESTROY: Uint = 0x0002;
 const WM_PAINT: Uint = 0x000F;
+const WM_COMMAND: Uint = 0x0111;
 const WM_TIMER: Uint = 0x0113;
 const WM_KEYDOWN: Uint = 0x0100;
 const VK_ESCAPE: Wparam = 0x1B;
+const VK_RETURN: Wparam = 0x0D;
+const KEY_R: Wparam = 0x52;
+const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
 const CS_HREDRAW: Uint = 0x0002;
 const CS_VREDRAW: Uint = 0x0001;
@@ -48,9 +58,25 @@ const COLOR_WINDOW: isize = 5;
 const DT_LEFT: Uint = 0x0000;
 const DT_TOP: Uint = 0x0000;
 const DT_SINGLELINE: Uint = 0x0020;
+const WS_CHILD: Dword = 0x4000_0000;
+const WS_TABSTOP: Dword = 0x0001_0000;
+const WS_VSCROLL: Dword = 0x0020_0000;
+const CBS_DROPDOWNLIST: Dword = 0x0003;
+const BS_DEFPUSHBUTTON: Dword = 0x0001;
+const BS_PUSHBUTTON: Dword = 0x0000;
+const CBN_SELCHANGE: u16 = 1;
+const BN_CLICKED: u16 = 0;
+const CB_ADDSTRING: Uint = 0x0143;
+const CB_GETCURSEL: Uint = 0x0147;
+const CB_RESETCONTENT: Uint = 0x014B;
+const CB_SETCURSEL: Uint = 0x014E;
+const CB_ERR: Lresult = -1;
+const IDC_DEVICE_COMBO: u16 = 1001;
+const IDC_PRIMARY_BUTTON: u16 = 1002;
+const IDC_RESTART_BUTTON: u16 = 1003;
 
 #[repr(C)]
-struct JOYCAPSW {
+struct JoyCapsW {
     w_mid: u16,
     w_pid: u16,
     sz_pname: [u16; 32],
@@ -78,7 +104,7 @@ struct JOYCAPSW {
 }
 
 #[repr(C)]
-struct JOYINFOEX {
+struct JoyInfoEx {
     dw_size: Dword,
     dw_flags: Dword,
     dw_xpos: Dword,
@@ -147,8 +173,8 @@ struct WndClassW {
 #[link(name = "winmm")]
 unsafe extern "system" {
     fn joyGetNumDevs() -> Uint;
-    fn joyGetDevCapsW(uJoyID: Uint, pjc: *mut JOYCAPSW, cbjc: Uint) -> Uint;
-    fn joyGetPosEx(uJoyID: Uint, pji: *mut JOYINFOEX) -> Uint;
+    fn joyGetDevCapsW(uJoyID: Uint, pjc: *mut JoyCapsW, cbjc: Uint) -> Uint;
+    fn joyGetPosEx(uJoyID: Uint, pji: *mut JoyInfoEx) -> Uint;
 }
 
 #[link(name = "user32")]
@@ -171,8 +197,15 @@ unsafe extern "system" {
     fn DefWindowProcW(hwnd: Hwnd, msg: Uint, wparam: Wparam, lparam: Lparam) -> Lresult;
     fn DestroyWindow(hwnd: Hwnd) -> Bool;
     fn DispatchMessageW(lpMsg: *const Msg) -> Lresult;
-    fn DrawTextW(hdc: Hdc, lpchText: *const u16, cchText: i32, lprc: *mut Rect, format: Uint) -> i32;
+    fn DrawTextW(
+        hdc: Hdc,
+        lpchText: *const u16,
+        cchText: i32,
+        lprc: *mut Rect,
+        format: Uint,
+    ) -> i32;
     fn EndPaint(hwnd: Hwnd, lpPaint: *const PaintStruct) -> Bool;
+    fn EnableWindow(hWnd: Hwnd, bEnable: Bool) -> Bool;
     fn FillRect(hDC: Hdc, lprc: *const Rect, hbr: Hbrush) -> i32;
     fn GetClientRect(hWnd: Hwnd, lpRect: *mut Rect) -> Bool;
     fn GetMessageW(lpMsg: *mut Msg, hWnd: Hwnd, wMsgFilterMin: Uint, wMsgFilterMax: Uint) -> Bool;
@@ -180,7 +213,9 @@ unsafe extern "system" {
     fn LoadCursorW(hInstance: Hinstance, lpCursorName: *const u16) -> Hcursor;
     fn PostQuitMessage(nExitCode: i32);
     fn RegisterClassW(lpWndClass: *const WndClassW) -> u16;
+    fn SendMessageW(hWnd: Hwnd, Msg: Uint, wParam: Wparam, lParam: Lparam) -> Lresult;
     fn SetTimer(hWnd: Hwnd, nIDEvent: usize, uElapse: Uint, lpTimerFunc: *const c_void) -> usize;
+    fn SetWindowTextW(hWnd: Hwnd, lpString: *const u16) -> Bool;
     fn ShowWindow(hWnd: Hwnd, nCmdShow: i32) -> Bool;
     fn TranslateMessage(lpMsg: *const Msg) -> Bool;
     fn UpdateWindow(hWnd: Hwnd) -> Bool;
@@ -199,53 +234,67 @@ unsafe extern "system" {
     fn GetModuleHandleW(lpModuleName: *const u16) -> Hinstance;
 }
 
-#[derive(Clone)]
-struct Axis {
-    label: &'static str,
-    min: u32,
-    max: u32,
-    raw: u32,
-}
+struct WinmmDeviceProvider;
 
-impl Axis {
-    fn percent(&self) -> f32 {
-        if self.max <= self.min {
-            return 0.0;
+impl DeviceProvider for WinmmDeviceProvider {
+    fn enumerate_devices(&self) -> Vec<DeviceSnapshot> {
+        let count = unsafe { joyGetNumDevs() };
+        let mut devices = Vec::new();
+
+        for id in 0..count {
+            let mut caps: JoyCapsW = unsafe { zeroed() };
+            let result = unsafe { joyGetDevCapsW(id, &mut caps, size_of::<JoyCapsW>() as u32) };
+            if result != JOYERR_NOERROR {
+                continue;
+            }
+
+            let mut device = DeviceSnapshot {
+                id,
+                name: name_from_wide(&caps.sz_pname),
+                axes: axes_from_caps(&caps),
+            };
+
+            if let Some(values) = self.read_axes(id) {
+                for (axis, raw) in device.axes.iter_mut().zip(values) {
+                    axis.raw = raw;
+                }
+            }
+
+            devices.push(device);
         }
 
-        let clamped = self.raw.clamp(self.min, self.max);
-        (clamped - self.min) as f32 / (self.max - self.min) as f32
+        devices
+    }
+
+    fn read_axes(&self, device_id: u32) -> Option<Vec<u32>> {
+        read_axis_values(device_id).map(Vec::from)
     }
 }
 
-struct AppState {
-    device_id: Option<u32>,
-    device_name: String,
-    axes: Vec<Axis>,
-    status: String,
-}
+static STATE: OnceLock<Mutex<Wizard<WinmmDeviceProvider>>> = OnceLock::new();
+static CONTROLS: OnceLock<Mutex<UiControls>> = OnceLock::new();
 
-static STATE: OnceLock<Mutex<AppState>> = OnceLock::new();
+struct UiControls {
+    device_combo: Hwnd,
+    primary_button: Hwnd,
+    restart_button: Hwnd,
+    device_signature: Vec<(u32, String)>,
+    combo_selected: Option<usize>,
+    combo_visible: bool,
+    primary_visible: bool,
+    primary_enabled: bool,
+    primary_text: String,
+    restart_visible: bool,
+}
 
 fn main() {
-    let state = STATE.get_or_init(|| Mutex::new(AppState {
-        device_id: None,
-        device_name: "No device".to_string(),
-        axes: Vec::new(),
-        status: "Searching for pedals...".to_string(),
-    }));
-
-    if let Ok(mut state) = state.lock() {
-        refresh_device(&mut state);
-        poll_device(&mut state);
-    }
-
+    STATE.get_or_init(|| Mutex::new(Wizard::new(WinmmDeviceProvider)));
     unsafe { run_window() };
 }
 
 unsafe fn run_window() {
     let class_name = wide("ApexFootworkWindow");
-    let title = wide("MOZA pedal input prototype");
+    let title = wide("Apex Footwork setup");
     let h_instance = unsafe { GetModuleHandleW(null()) };
     let cursor = unsafe { LoadCursorW(0, 32512usize as *const u16) };
 
@@ -271,8 +320,8 @@ unsafe fn run_window() {
             0x10CF_0000,
             100,
             100,
-            720,
-            420,
+            780,
+            520,
             0,
             0,
             h_instance,
@@ -298,30 +347,44 @@ unsafe fn run_window() {
     }
 }
 
-unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: Uint, wparam: Wparam, lparam: Lparam) -> Lresult {
+unsafe extern "system" fn window_proc(
+    hwnd: Hwnd,
+    msg: Uint,
+    wparam: Wparam,
+    lparam: Lparam,
+) -> Lresult {
     match msg {
         WM_CREATE => {
             unsafe { SetTimer(hwnd, 1, 16, null()) };
+            create_controls(hwnd);
             0
         }
         WM_TIMER => {
-            if let Some(lock) = STATE.get() {
-                if let Ok(mut state) = lock.lock() {
-                    if state.device_id.is_none() {
-                        refresh_device(&mut state);
-                    }
-                    poll_device(&mut state);
-                }
+            with_wizard(|wizard| wizard.update());
+            sync_controls();
+            unsafe { InvalidateRect(hwnd, null(), 1) };
+            0
+        }
+        WM_COMMAND => {
+            handle_control_command(wparam, lparam);
+            sync_controls();
+            unsafe { InvalidateRect(hwnd, null(), 1) };
+            0
+        }
+        WM_KEYDOWN if wparam == VK_ESCAPE => {
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_KEYDOWN => {
+            if let Some(command) = command_from_key(wparam) {
+                with_wizard(|wizard| wizard.handle_command(command));
+                sync_controls();
             }
             unsafe { InvalidateRect(hwnd, null(), 1) };
             0
         }
         WM_PAINT => {
             draw(hwnd);
-            0
-        }
-        WM_KEYDOWN if wparam == VK_ESCAPE => {
-            unsafe { DestroyWindow(hwnd) };
             0
         }
         WM_DESTROY => {
@@ -332,60 +395,271 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: Uint, wparam: Wparam, lpa
     }
 }
 
-fn refresh_device(state: &mut AppState) {
-    let count = unsafe { joyGetNumDevs() };
-    let mut fallback: Option<(u32, JOYCAPSW)> = None;
-    let mut moza: Option<(u32, JOYCAPSW)> = None;
-
-    for id in 0..count {
-        let mut caps: JOYCAPSW = unsafe { zeroed() };
-        let result = unsafe { joyGetDevCapsW(id, &mut caps, size_of::<JOYCAPSW>() as u32) };
-        if result != JOYERR_NOERROR {
-            continue;
-        }
-
-        let device_name = name_from_wide(&caps.sz_pname);
-        if device_name.to_uppercase().contains("MOZA") {
-            moza = Some((id, caps));
-            break;
-        }
-
-        if fallback.is_none() {
-            fallback = Some((id, caps));
-        }
-    }
-
-    if let Some((id, caps)) = moza.or(fallback) {
-        state.device_id = Some(id);
-        state.device_name = name_from_wide(&caps.sz_pname);
-        state.status = if state.device_name.to_uppercase().contains("MOZA") {
-            "MOZA device detected".to_string()
-        } else {
-            "MOZA not found; showing first joystick device".to_string()
-        };
-        state.axes = vec![
-            Axis { label: "X", min: caps.w_xmin, max: caps.w_xmax, raw: 0 },
-            Axis { label: "Y", min: caps.w_ymin, max: caps.w_ymax, raw: 0 },
-            Axis { label: "Z", min: caps.w_zmin, max: caps.w_zmax, raw: 0 },
-            Axis { label: "R", min: caps.w_rmin, max: caps.w_rmax, raw: 0 },
-            Axis { label: "U", min: caps.w_umin, max: caps.w_umax, raw: 0 },
-            Axis { label: "V", min: caps.w_vmin, max: caps.w_vmax, raw: 0 },
-        ];
-    } else {
-        state.device_id = None;
-        state.device_name = "No joystick/HID pedal device found".to_string();
-        state.axes.clear();
-        state.status = "Plug in pedals, then wait a moment".to_string();
+fn command_from_key(key: Wparam) -> Option<WizardCommand> {
+    match key {
+        VK_RETURN => Some(WizardCommand::Confirm),
+        KEY_R => Some(WizardCommand::Restart),
+        _ => None,
     }
 }
 
-fn poll_device(state: &mut AppState) {
-    let Some(device_id) = state.device_id else {
+fn with_wizard(action: impl FnOnce(&mut Wizard<WinmmDeviceProvider>)) {
+    if let Some(lock) = STATE.get() {
+        if let Ok(mut wizard) = lock.lock() {
+            action(&mut wizard);
+        }
+    }
+}
+
+fn create_controls(parent: Hwnd) {
+    let h_instance = unsafe { GetModuleHandleW(null()) };
+    let combo_class = wide("COMBOBOX");
+    let button_class = wide("BUTTON");
+    let use_device = wide("Use device");
+    let restart = wide("Restart");
+
+    let device_combo = unsafe {
+        CreateWindowExW(
+            0,
+            combo_class.as_ptr(),
+            null(),
+            WS_CHILD | WS_VSCROLL | CBS_DROPDOWNLIST,
+            24,
+            150,
+            520,
+            180,
+            parent,
+            IDC_DEVICE_COMBO as isize,
+            h_instance,
+            null_mut(),
+        )
+    };
+    let primary_button = unsafe {
+        CreateWindowExW(
+            0,
+            button_class.as_ptr(),
+            use_device.as_ptr(),
+            WS_CHILD | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            560,
+            149,
+            118,
+            28,
+            parent,
+            IDC_PRIMARY_BUTTON as isize,
+            h_instance,
+            null_mut(),
+        )
+    };
+    let restart_button = unsafe {
+        CreateWindowExW(
+            0,
+            button_class.as_ptr(),
+            restart.as_ptr(),
+            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+            688,
+            149,
+            68,
+            28,
+            parent,
+            IDC_RESTART_BUTTON as isize,
+            h_instance,
+            null_mut(),
+        )
+    };
+
+    let _ = CONTROLS.set(Mutex::new(UiControls {
+        device_combo,
+        primary_button,
+        restart_button,
+        device_signature: Vec::new(),
+        combo_selected: None,
+        combo_visible: false,
+        primary_visible: false,
+        primary_enabled: false,
+        primary_text: String::new(),
+        restart_visible: false,
+    }));
+
+    sync_controls();
+}
+
+fn handle_control_command(wparam: Wparam, lparam: Lparam) {
+    let control_id = loword(wparam);
+    let notification = hiword(wparam);
+
+    match (control_id, notification) {
+        (IDC_DEVICE_COMBO, CBN_SELCHANGE) => {
+            if let Some(index) = combo_current_selection(lparam as Hwnd) {
+                with_wizard(|wizard| wizard.handle_command(WizardCommand::SelectDevice(index)));
+            }
+        }
+        (IDC_PRIMARY_BUTTON, BN_CLICKED) => {
+            with_wizard(|wizard| wizard.handle_command(WizardCommand::Confirm));
+        }
+        (IDC_RESTART_BUTTON, BN_CLICKED) => {
+            with_wizard(|wizard| wizard.handle_command(WizardCommand::Restart));
+        }
+        _ => {}
+    }
+}
+
+fn sync_controls() {
+    let Some(view) = current_view() else {
+        return;
+    };
+    let Some(lock) = CONTROLS.get() else {
+        return;
+    };
+    let Ok(mut controls) = lock.lock() else {
         return;
     };
 
-    let mut info = JOYINFOEX {
-        dw_size: size_of::<JOYINFOEX>() as u32,
+    match &view.step {
+        WizardStepView::SelectDevice {
+            devices,
+            selected_index,
+        } => {
+            populate_device_combo(&mut controls, devices, *selected_index);
+            set_visible(controls.device_combo, &mut controls.combo_visible, true);
+            set_visible(controls.primary_button, &mut controls.primary_visible, true);
+            set_enabled(
+                controls.primary_button,
+                &mut controls.primary_enabled,
+                !devices.is_empty(),
+            );
+            set_window_text(
+                controls.primary_button,
+                &mut controls.primary_text,
+                "Use device",
+            );
+            set_visible(controls.restart_button, &mut controls.restart_visible, true);
+        }
+        WizardStepView::Capture { role, armed, .. } => {
+            set_visible(controls.device_combo, &mut controls.combo_visible, false);
+            set_visible(controls.primary_button, &mut controls.primary_visible, true);
+            set_enabled(
+                controls.primary_button,
+                &mut controls.primary_enabled,
+                !armed,
+            );
+            let text = if *armed {
+                format!("Waiting for {}", role.label())
+            } else {
+                format!("Capture {}", role.label())
+            };
+            set_window_text(controls.primary_button, &mut controls.primary_text, &text);
+            set_visible(controls.restart_button, &mut controls.restart_visible, true);
+        }
+        WizardStepView::Ready { .. } => {
+            set_visible(controls.device_combo, &mut controls.combo_visible, false);
+            set_visible(
+                controls.primary_button,
+                &mut controls.primary_visible,
+                false,
+            );
+            set_visible(controls.restart_button, &mut controls.restart_visible, true);
+        }
+    }
+}
+
+fn populate_device_combo(
+    controls: &mut UiControls,
+    devices: &[DeviceSnapshot],
+    selected_index: usize,
+) {
+    let signature = devices
+        .iter()
+        .map(|device| (device.id, device.name.clone()))
+        .collect::<Vec<_>>();
+
+    if controls.device_signature != signature {
+        unsafe {
+            SendMessageW(controls.device_combo, CB_RESETCONTENT, 0, 0);
+        }
+
+        for device in devices {
+            let text = wide(&format!(
+                "[{}] {} ({} axes)",
+                device.id,
+                device.name,
+                device.axes.len()
+            ));
+            unsafe {
+                SendMessageW(
+                    controls.device_combo,
+                    CB_ADDSTRING,
+                    0,
+                    text.as_ptr() as Lparam,
+                );
+            }
+        }
+
+        controls.device_signature = signature;
+        controls.combo_selected = None;
+    }
+
+    if !devices.is_empty() && controls.combo_selected != Some(selected_index) {
+        unsafe {
+            SendMessageW(controls.device_combo, CB_SETCURSEL, selected_index, 0);
+        }
+        controls.combo_selected = Some(selected_index);
+    }
+}
+
+fn combo_current_selection(combo: Hwnd) -> Option<usize> {
+    if combo == 0 {
+        return None;
+    }
+
+    let index = unsafe { SendMessageW(combo, CB_GETCURSEL, 0, 0) };
+    (index != CB_ERR).then_some(index as usize)
+}
+
+fn set_visible(hwnd: Hwnd, current: &mut bool, visible: bool) {
+    if *current != visible {
+        unsafe { ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE }) };
+        *current = visible;
+    }
+}
+
+fn set_enabled(hwnd: Hwnd, current: &mut bool, enabled: bool) {
+    if *current != enabled {
+        unsafe { EnableWindow(hwnd, enabled as Bool) };
+        *current = enabled;
+    }
+}
+
+fn set_window_text(hwnd: Hwnd, current: &mut String, text: &str) {
+    if current != text {
+        let value = wide(text);
+        unsafe { SetWindowTextW(hwnd, value.as_ptr()) };
+        current.clear();
+        current.push_str(text);
+    }
+}
+
+fn loword(value: Wparam) -> u16 {
+    (value & 0xFFFF) as u16
+}
+
+fn hiword(value: Wparam) -> u16 {
+    ((value >> 16) & 0xFFFF) as u16
+}
+
+fn axes_from_caps(caps: &JoyCapsW) -> Vec<AxisSnapshot> {
+    vec![
+        AxisSnapshot::new("X", caps.w_xmin, caps.w_xmax, 0),
+        AxisSnapshot::new("Y", caps.w_ymin, caps.w_ymax, 0),
+        AxisSnapshot::new("Z", caps.w_zmin, caps.w_zmax, 0),
+        AxisSnapshot::new("R", caps.w_rmin, caps.w_rmax, 0),
+        AxisSnapshot::new("U", caps.w_umin, caps.w_umax, 0),
+        AxisSnapshot::new("V", caps.w_vmin, caps.w_vmax, 0),
+    ]
+}
+
+fn read_axis_values(device_id: u32) -> Option<[u32; 6]> {
+    let mut info = JoyInfoEx {
+        dw_size: size_of::<JoyInfoEx>() as u32,
         dw_flags: JOY_RETURNALL,
         dw_xpos: 0,
         dw_ypos: 0,
@@ -402,23 +676,17 @@ fn poll_device(state: &mut AppState) {
 
     let result = unsafe { joyGetPosEx(device_id, &mut info) };
     if result != JOYERR_NOERROR {
-        state.device_id = None;
-        state.status = "Lost device; searching again...".to_string();
-        return;
+        return None;
     }
 
-    let values = [
+    Some([
         info.dw_xpos,
         info.dw_ypos,
         info.dw_zpos,
         info.dw_rpos,
         info.dw_upos,
         info.dw_vpos,
-    ];
-
-    for (axis, raw) in state.axes.iter_mut().zip(values) {
-        axis.raw = raw;
-    }
+    ])
 }
 
 fn draw(hwnd: Hwnd) {
@@ -437,46 +705,196 @@ fn draw(hwnd: Hwnd) {
         DeleteObject(bg);
     }
 
-    if let Some(lock) = STATE.get() {
-        if let Ok(state) = lock.lock() {
-            draw_text(hdc, 24, 22, 660, 28, &format!("Device: {}", state.device_name));
-            draw_text(hdc, 24, 52, 660, 24, &state.status);
-
-            if state.axes.is_empty() {
-                draw_text(hdc, 24, 112, 660, 24, "No axes to display yet.");
-            } else {
-                for (i, axis) in state.axes.iter().enumerate() {
-                    draw_axis(hdc, 24, 102 + (i as i32 * 46), 620, axis);
-                }
-            }
-
-            draw_text(hdc, 24, rect.bottom - 38, 660, 24, "Esc closes the prototype");
-        }
+    if let Some(view) = current_view() {
+        draw_view(hdc, &view, rect);
     }
 
     unsafe { EndPaint(hwnd, &ps) };
 }
 
-fn draw_axis(hdc: Hdc, x: i32, y: i32, width: i32, axis: &Axis) {
+fn current_view() -> Option<WizardView> {
+    let lock = STATE.get()?;
+    let wizard = lock.lock().ok()?;
+    Some(wizard.view())
+}
+
+fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
+    draw_text(hdc, 24, 20, 720, 28, "Apex Footwork setup wizard");
+    draw_text(hdc, 24, 52, 720, 24, &view.status);
+    draw_text(hdc, 24, 78, 720, 22, view.step.title());
+
+    match &view.step {
+        WizardStepView::SelectDevice {
+            devices,
+            selected_index,
+        } => {
+            draw_device_picker(hdc, devices, *selected_index);
+        }
+        WizardStepView::Capture {
+            role,
+            armed,
+            device,
+            bindings,
+        } => {
+            draw_capture_step(hdc, *role, *armed, device, bindings);
+        }
+        WizardStepView::Ready {
+            device,
+            bindings,
+            values,
+        } => {
+            draw_ready(hdc, device, bindings, values);
+        }
+    }
+
+    draw_text(
+        hdc,
+        24,
+        rect.bottom - 34,
+        720,
+        22,
+        "Esc closes  |  Restart runs setup again",
+    );
+}
+
+fn draw_device_picker(hdc: Hdc, devices: &[DeviceSnapshot], _selected_index: usize) {
+    draw_text(
+        hdc,
+        24,
+        124,
+        720,
+        22,
+        "Choose a controller from the dropdown, then click Use device.",
+    );
+
+    if devices.is_empty() {
+        draw_text(hdc, 24, 196, 720, 22, "No devices are currently available.");
+    }
+}
+
+fn draw_capture_step(
+    hdc: Hdc,
+    role: InputRole,
+    armed: bool,
+    device: &Option<DeviceSnapshot>,
+    bindings: &PedalBindings,
+) {
+    let device_name = device
+        .as_ref()
+        .map(|device| device.name.as_str())
+        .unwrap_or("No active device");
+    draw_text(hdc, 24, 124, 720, 22, &format!("Device: {}", device_name));
+
+    let instruction = if armed {
+        format!(
+            "Press {} fully now. The moving axis will be detected.",
+            role.label()
+        )
+    } else {
+        format!("Release all pedals, then click Capture {}.", role.label())
+    };
+    draw_text(hdc, 24, 150, 520, 22, &instruction);
+
+    if let Some(device) = device {
+        for (i, axis) in device.axes.iter().enumerate() {
+            draw_axis(hdc, 24, 194 + (i as i32 * 42), 560, axis);
+        }
+    }
+
+    draw_binding_summary(hdc, bindings, 610, 194);
+}
+
+fn draw_ready(
+    hdc: Hdc,
+    device: &Option<DeviceSnapshot>,
+    bindings: &PedalBindings,
+    values: &[(InputRole, f32)],
+) {
+    let device_name = device
+        .as_ref()
+        .map(|device| device.name.as_str())
+        .unwrap_or("No active device");
+    draw_text(hdc, 24, 124, 720, 22, &format!("Using: {}", device_name));
+
+    let throttle = values
+        .iter()
+        .find_map(|(role, value)| (*role == InputRole::Throttle).then_some(*value))
+        .unwrap_or(0.0);
+    let brake = values
+        .iter()
+        .find_map(|(role, value)| (*role == InputRole::Brake).then_some(*value))
+        .unwrap_or(0.0);
+
+    draw_value_bar(hdc, 24, 176, 620, "Throttle", throttle, rgb(19, 132, 109));
+    draw_value_bar(hdc, 24, 238, 620, "Brake", brake, rgb(180, 47, 54));
+    draw_text(
+        hdc,
+        24,
+        316,
+        720,
+        22,
+        "Live normalized pedal values are ready for the overlay layer.",
+    );
+    draw_binding_summary(hdc, bindings, 24, 354);
+}
+
+fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
+    draw_text(hdc, x, y, 150, 22, "Bindings");
+    draw_binding_line(
+        hdc,
+        x,
+        y + 30,
+        InputRole::Throttle,
+        bindings.throttle.as_ref(),
+    );
+    draw_binding_line(hdc, x, y + 58, InputRole::Brake, bindings.brake.as_ref());
+}
+
+fn draw_binding_line(hdc: Hdc, x: i32, y: i32, role: InputRole, binding: Option<&BindingView>) {
+    let text = if let Some(binding) = binding {
+        format!(
+            "{}: {} idle={} active={}",
+            role.label(),
+            binding.axis_label,
+            binding.idle_raw,
+            binding.active_raw
+        )
+    } else {
+        format!("{}: not set", role.label())
+    };
+    draw_text(hdc, x, y, 520, 22, &text);
+}
+
+fn draw_axis(hdc: Hdc, x: i32, y: i32, width: i32, axis: &AxisSnapshot) {
     let percent = axis.percent();
     let label = format!("{}  raw={}  {:.0}%", axis.label, axis.raw, percent * 100.0);
-    draw_text(hdc, x, y, width, 20, &label);
+    draw_text(hdc, x, y, width, 18, &label);
+    draw_bar(hdc, x, y + 20, width, 14, percent, rgb(19, 132, 109));
+}
 
+fn draw_value_bar(hdc: Hdc, x: i32, y: i32, width: i32, label: &str, value: f32, color: Dword) {
+    let text = format!("{}  {:.0}%", label, value * 100.0);
+    draw_text(hdc, x, y, width, 22, &text);
+    draw_bar(hdc, x, y + 28, width, 22, value, color);
+}
+
+fn draw_bar(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, percent: f32, fill_color: Dword) {
+    let percent = percent.clamp(0.0, 1.0);
     let bar = Rect {
         left: x,
-        top: y + 22,
+        top: y,
         right: x + width,
-        bottom: y + 38,
+        bottom: y + height,
     };
     let filled = Rect {
         left: x,
-        top: y + 22,
+        top: y,
         right: x + ((width as f32 * percent).round() as i32),
-        bottom: y + 38,
+        bottom: y + height,
     };
 
     let empty_brush = unsafe { CreateSolidBrush(rgb(222, 226, 231)) };
-    let fill_brush = unsafe { CreateSolidBrush(rgb(19, 132, 109)) };
+    let fill_brush = unsafe { CreateSolidBrush(fill_color) };
     unsafe {
         FillRect(hdc, &bar, empty_brush);
         FillRect(hdc, &filled, fill_brush);
