@@ -348,6 +348,7 @@ static SAVED_PROFILE_SIGNATURE: OnceLock<Mutex<Option<String>>> = OnceLock::new(
 static OVERLAY_SETTINGS: OnceLock<Mutex<OverlaySettings>> = OnceLock::new();
 static RESIZE_DRAG: OnceLock<Mutex<Option<ResizeDrag>>> = OnceLock::new();
 static OVERLAY_HWND: OnceLock<Mutex<Hwnd>> = OnceLock::new();
+static DEVICE_DROPDOWN_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
 
 struct UiFonts {
     title: Hfont,
@@ -416,6 +417,7 @@ fn main() {
     OVERLAY_SETTINGS.get_or_init(|| Mutex::new(OverlaySettings::default()));
     RESIZE_DRAG.get_or_init(|| Mutex::new(None));
     OVERLAY_HWND.get_or_init(|| Mutex::new(0));
+    DEVICE_DROPDOWN_OPEN.get_or_init(|| Mutex::new(false));
 
     let mut wizard = Wizard::new(WinmmDeviceProvider);
     if let Some(saved_profile) = profile::load_profile() {
@@ -784,15 +786,22 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
 
     if point_in_rect(x, y, configure_button_rect(rect)) {
         close_overlay_window();
+        close_device_dropdown();
         with_wizard(|wizard| wizard.handle_command(WizardCommand::Configure));
         return true;
     }
 
+    if handle_device_dropdown_click(rect, x, y) {
+        return true;
+    }
+
     if handle_primary_action_click(rect, x, y) {
+        close_device_dropdown();
         return true;
     }
 
     if handle_capture_settings_click(rect, x, y) {
+        close_device_dropdown();
         return true;
     }
 
@@ -804,6 +813,44 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
         return true;
     }
 
+    false
+}
+
+fn handle_device_dropdown_click(client: Rect, x: i32, y: i32) -> bool {
+    let Some(view) = current_view() else {
+        return false;
+    };
+
+    let WizardStepView::SelectDevice {
+        devices,
+        selected_index: _,
+    } = view.step
+    else {
+        close_device_dropdown();
+        return false;
+    };
+
+    let header = device_dropdown_rect(client);
+    if point_in_rect(x, y, header) {
+        if !devices.is_empty() {
+            toggle_device_dropdown();
+        }
+        return true;
+    }
+
+    if !is_device_dropdown_open() {
+        return false;
+    }
+
+    for index in 0..devices.len() {
+        if point_in_rect(x, y, device_dropdown_item_rect(header, index)) {
+            with_wizard(|wizard| wizard.handle_command(WizardCommand::SelectDevice(index)));
+            close_device_dropdown();
+            return true;
+        }
+    }
+
+    close_device_dropdown();
     false
 }
 
@@ -1058,6 +1105,22 @@ fn select_primary_button_rect(client: Rect) -> Rect {
     rect_xywh(right - width, 153, width, 30)
 }
 
+fn device_dropdown_rect(client: Rect) -> Rect {
+    let button = select_primary_button_rect(client);
+    let left = 32;
+    let right = (button.left - 16).max(left + 260);
+    rect_xywh(left, 153, right - left, 34)
+}
+
+fn device_dropdown_item_rect(header: Rect, index: usize) -> Rect {
+    rect_xywh(
+        header.left,
+        header.bottom + 4 + (index as i32 * 32),
+        header.right - header.left,
+        32,
+    )
+}
+
 fn init_fonts() {
     let _ = FONTS.set(UiFonts {
         title: create_ui_font(-26, FW_SEMIBOLD),
@@ -1140,7 +1203,7 @@ fn sync_controls() {
             selected_index,
         } => {
             populate_device_combo(&mut controls, devices, *selected_index);
-            set_visible(controls.device_combo, &mut controls.combo_visible, true);
+            set_visible(controls.device_combo, &mut controls.combo_visible, false);
             set_visible(
                 controls.primary_button,
                 &mut controls.primary_visible,
@@ -1153,6 +1216,7 @@ fn sync_controls() {
             );
         }
         WizardStepView::Capture { .. } => {
+            close_device_dropdown();
             set_visible(controls.device_combo, &mut controls.combo_visible, false);
             set_visible(
                 controls.primary_button,
@@ -1166,6 +1230,7 @@ fn sync_controls() {
             );
         }
         WizardStepView::Ready { .. } => {
+            close_device_dropdown();
             set_visible(controls.device_combo, &mut controls.combo_visible, false);
             set_visible(
                 controls.primary_button,
@@ -1227,6 +1292,32 @@ fn combo_current_selection(combo: Hwnd) -> Option<usize> {
 
     let index = unsafe { SendMessageW(combo, CB_GETCURSEL, 0, 0) };
     (index != CB_ERR).then_some(index as usize)
+}
+
+fn is_device_dropdown_open() -> bool {
+    DEVICE_DROPDOWN_OPEN
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+        .map(|open| *open)
+        .unwrap_or(false)
+}
+
+fn toggle_device_dropdown() {
+    if let Ok(mut open) = DEVICE_DROPDOWN_OPEN
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+    {
+        *open = !*open;
+    }
+}
+
+fn close_device_dropdown() {
+    if let Ok(mut open) = DEVICE_DROPDOWN_OPEN
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+    {
+        *open = false;
+    }
 }
 
 fn set_visible(hwnd: Hwnd, current: &mut bool, visible: bool) {
@@ -1773,6 +1864,7 @@ fn draw_device_picker(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], _selec
         22,
         "Choose a controller from the dropdown, then click Use device.",
     );
+    draw_device_dropdown(hdc, client, devices, _selected_index);
     if devices.is_empty() {
         draw_hud_button_disabled(hdc, select_primary_button_rect(client), "Use device");
     } else {
@@ -1781,6 +1873,137 @@ fn draw_device_picker(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], _selec
 
     if devices.is_empty() {
         draw_text(hdc, 24, 196, 720, 22, "No devices are currently available.");
+    }
+}
+
+fn draw_device_dropdown(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], selected_index: usize) {
+    let rect = device_dropdown_rect(client);
+    let open = is_device_dropdown_open();
+    let label = devices
+        .get(selected_index)
+        .map(|device| {
+            format!(
+                "[{}] {} ({} axes)",
+                device.id,
+                device.name,
+                device.axes.len()
+            )
+        })
+        .unwrap_or_else(|| "No devices available".to_string());
+
+    draw_panel_with_border(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        color_panel_raised(),
+        if open {
+            color_accent()
+        } else {
+            rgb(74, 84, 102)
+        },
+    );
+    draw_text_kind(
+        hdc,
+        rect.left + 12,
+        rect.top + 8,
+        (rect.right - rect.left - 54).max(0),
+        18,
+        &label,
+        TextKind::Meta,
+        if devices.is_empty() {
+            color_muted()
+        } else {
+            color_text()
+        },
+    );
+    draw_dropdown_arrow(hdc, rect, open);
+
+    if !open || devices.is_empty() {
+        return;
+    }
+
+    for (index, device) in devices.iter().enumerate() {
+        let item = device_dropdown_item_rect(rect, index);
+        let selected = index == selected_index;
+        draw_panel_with_border(
+            hdc,
+            item.left,
+            item.top,
+            item.right - item.left,
+            item.bottom - item.top,
+            if selected {
+                blend_colors(color_panel_raised(), color_accent(), 0.16)
+            } else {
+                color_panel_raised()
+            },
+            rgb(48, 55, 68),
+        );
+        draw_text_kind(
+            hdc,
+            item.left + 12,
+            item.top + 7,
+            item.right - item.left - 24,
+            18,
+            &format!(
+                "[{}] {} ({} axes)",
+                device.id,
+                device.name,
+                device.axes.len()
+            ),
+            TextKind::Meta,
+            if selected {
+                color_accent()
+            } else {
+                color_text()
+            },
+        );
+    }
+}
+
+fn draw_dropdown_arrow(hdc: Hdc, rect: Rect, open: bool) {
+    let center_x = rect.right - 20;
+    let center_y = rect.top + ((rect.bottom - rect.top) / 2);
+    let color = color_muted();
+    if open {
+        draw_line(
+            hdc,
+            center_x - 5,
+            center_y + 3,
+            center_x,
+            center_y - 3,
+            color,
+            2,
+        );
+        draw_line(
+            hdc,
+            center_x,
+            center_y - 3,
+            center_x + 5,
+            center_y + 3,
+            color,
+            2,
+        );
+    } else {
+        draw_line(
+            hdc,
+            center_x - 5,
+            center_y - 3,
+            center_x,
+            center_y + 3,
+            color,
+            2,
+        );
+        draw_line(
+            hdc,
+            center_x,
+            center_y + 3,
+            center_x + 5,
+            center_y - 3,
+            color,
+            2,
+        );
     }
 }
 
