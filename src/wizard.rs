@@ -1,3 +1,5 @@
+use crate::profile::{StoredBinding, StoredProfile};
+
 #[derive(Clone, Debug)]
 pub struct AxisSnapshot {
     pub label: &'static str,
@@ -97,7 +99,7 @@ impl PedalBindings {
 pub enum WizardCommand {
     SelectDevice(usize),
     Confirm,
-    Restart,
+    Configure,
 }
 
 #[derive(Clone, Debug)]
@@ -258,7 +260,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 }
             }
             WizardCommand::Confirm => self.confirm(),
-            WizardCommand::Restart => self.restart(),
+            WizardCommand::Configure => self.configure(),
             _ => {}
         }
     }
@@ -294,6 +296,59 @@ impl<P: DeviceProvider> Wizard<P> {
         self.bindings.is_complete().then(|| self.bindings.clone())
     }
 
+    pub fn restore_profile(&mut self, profile: &StoredProfile) -> bool {
+        self.refresh_devices();
+
+        let Some(index) = self.matching_device_index(profile) else {
+            self.status = "Saved profile found, but its device is not connected.".to_string();
+            return false;
+        };
+        let Some(device) = self.devices.get(index).cloned() else {
+            return false;
+        };
+
+        let Some(throttle) =
+            Self::binding_from_profile(InputRole::Throttle, &profile.throttle, &device)
+        else {
+            self.status = "Saved profile found, but throttle binding is invalid.".to_string();
+            return false;
+        };
+        let Some(brake) = Self::binding_from_profile(InputRole::Brake, &profile.brake, &device)
+        else {
+            self.status = "Saved profile found, but brake binding is invalid.".to_string();
+            return false;
+        };
+
+        self.selected_index = index;
+        self.active_device = Some(device);
+        self.poll_active_device();
+        if self.active_device.is_none() {
+            self.status = "Saved profile device disconnected while loading.".to_string();
+            return false;
+        }
+        self.bindings = PedalBindings {
+            throttle: Some(throttle),
+            brake: Some(brake),
+        };
+        self.value_history.clear();
+        self.step = WizardStep::Ready;
+        self.status = "Saved profile loaded. Overlay input is ready.".to_string();
+        true
+    }
+
+    pub fn profile(&self) -> Option<StoredProfile> {
+        let device = self.active_device.as_ref()?;
+        let throttle = self.bindings.throttle.as_ref()?;
+        let brake = self.bindings.brake.as_ref()?;
+
+        Some(StoredProfile {
+            device_id: device.id,
+            device_name: device.name.clone(),
+            throttle: Self::binding_to_profile(throttle),
+            brake: Self::binding_to_profile(brake),
+        })
+    }
+
     fn confirm(&mut self) {
         match self.step {
             WizardStep::SelectDevice => self.choose_selected_device(),
@@ -307,7 +362,7 @@ impl<P: DeviceProvider> Wizard<P> {
         }
     }
 
-    fn restart(&mut self) {
+    fn configure(&mut self) {
         self.active_device = None;
         self.bindings = PedalBindings::default();
         self.value_history.clear();
@@ -492,7 +547,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 self.step = WizardStep::Ready;
                 self.value_history.clear();
                 self.status =
-                    "Pedal inputs are configured. Press R to run the wizard again.".to_string();
+                    "Pedal inputs are configured. Press R to configure again.".to_string();
             }
         }
     }
@@ -510,6 +565,45 @@ impl<P: DeviceProvider> Wizard<P> {
             values.push((InputRole::Brake, binding.value(&device.axes)));
         }
         values
+    }
+
+    fn matching_device_index(&self, profile: &StoredProfile) -> Option<usize> {
+        self.devices
+            .iter()
+            .position(|device| device.id == profile.device_id && device.name == profile.device_name)
+            .or_else(|| {
+                self.devices
+                    .iter()
+                    .position(|device| device.name == profile.device_name)
+            })
+    }
+
+    fn binding_from_profile(
+        role: InputRole,
+        stored: &StoredBinding,
+        device: &DeviceSnapshot,
+    ) -> Option<BindingView> {
+        if stored.idle_raw == stored.active_raw {
+            return None;
+        }
+
+        let axis = device.axes.get(stored.axis_index)?;
+        Some(BindingView {
+            role,
+            axis_index: stored.axis_index,
+            axis_label: axis.label,
+            idle_raw: stored.idle_raw,
+            active_raw: stored.active_raw,
+        })
+    }
+
+    fn binding_to_profile(binding: &BindingView) -> StoredBinding {
+        StoredBinding {
+            axis_index: binding.axis_index,
+            axis_label: binding.axis_label.to_string(),
+            idle_raw: binding.idle_raw,
+            active_raw: binding.active_raw,
+        }
     }
 
     fn record_live_values(&mut self) {

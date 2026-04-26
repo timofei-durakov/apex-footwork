@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod profile;
 mod wizard;
 
 use std::ffi::c_void;
@@ -50,6 +51,7 @@ const WM_ERASEBKGND: Uint = 0x0014;
 const WM_COMMAND: Uint = 0x0111;
 const WM_TIMER: Uint = 0x0113;
 const WM_KEYDOWN: Uint = 0x0100;
+const WM_LBUTTONDOWN: Uint = 0x0201;
 const WM_SETFONT: Uint = 0x0030;
 const VK_ESCAPE: Wparam = 0x1B;
 const VK_RETURN: Wparam = 0x0D;
@@ -59,6 +61,8 @@ const SW_SHOW: i32 = 5;
 const CS_HREDRAW: Uint = 0x0002;
 const CS_VREDRAW: Uint = 0x0001;
 const DT_LEFT: Uint = 0x0000;
+const DT_CENTER: Uint = 0x0001;
+const DT_VCENTER: Uint = 0x0004;
 const DT_TOP: Uint = 0x0000;
 const DT_SINGLELINE: Uint = 0x0020;
 const WS_CHILD: Dword = 0x4000_0000;
@@ -66,7 +70,6 @@ const WS_TABSTOP: Dword = 0x0001_0000;
 const WS_VSCROLL: Dword = 0x0020_0000;
 const CBS_DROPDOWNLIST: Dword = 0x0003;
 const BS_DEFPUSHBUTTON: Dword = 0x0001;
-const BS_PUSHBUTTON: Dword = 0x0000;
 const WS_CLIPCHILDREN: Dword = 0x0200_0000;
 const WS_CLIPSIBLINGS: Dword = 0x0400_0000;
 const CBN_SELCHANGE: u16 = 1;
@@ -78,7 +81,6 @@ const CB_SETCURSEL: Uint = 0x014E;
 const CB_ERR: Lresult = -1;
 const IDC_DEVICE_COMBO: u16 = 1001;
 const IDC_PRIMARY_BUTTON: u16 = 1002;
-const IDC_RESTART_BUTTON: u16 = 1003;
 const SRCCOPY: Dword = 0x00CC_0020;
 const TRANSPARENT: i32 = 1;
 const FW_NORMAL: i32 = 400;
@@ -328,6 +330,7 @@ impl DeviceProvider for WinmmDeviceProvider {
 static STATE: OnceLock<Mutex<Wizard<WinmmDeviceProvider>>> = OnceLock::new();
 static CONTROLS: OnceLock<Mutex<UiControls>> = OnceLock::new();
 static FONTS: OnceLock<UiFonts> = OnceLock::new();
+static SAVED_PROFILE_SIGNATURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 struct UiFonts {
     title: Hfont,
@@ -339,18 +342,23 @@ struct UiFonts {
 struct UiControls {
     device_combo: Hwnd,
     primary_button: Hwnd,
-    restart_button: Hwnd,
     device_signature: Vec<(u32, String)>,
     combo_selected: Option<usize>,
     combo_visible: bool,
     primary_visible: bool,
     primary_enabled: bool,
     primary_text: String,
-    restart_visible: bool,
 }
 
 fn main() {
-    STATE.get_or_init(|| Mutex::new(Wizard::new(WinmmDeviceProvider)));
+    let mut wizard = Wizard::new(WinmmDeviceProvider);
+    if let Some(saved_profile) = profile::load_profile() {
+        if wizard.restore_profile(&saved_profile) {
+            remember_saved_profile(&saved_profile);
+        }
+    }
+
+    STATE.get_or_init(|| Mutex::new(wizard));
     unsafe { run_window() };
 }
 
@@ -434,6 +442,14 @@ unsafe extern "system" fn window_proc(
             unsafe { InvalidateRect(hwnd, null(), 0) };
             0
         }
+        WM_LBUTTONDOWN => {
+            if handle_mouse_down(hwnd, lparam) {
+                sync_controls();
+                unsafe { InvalidateRect(hwnd, null(), 0) };
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_KEYDOWN if wparam == VK_ESCAPE => {
             unsafe { DestroyWindow(hwnd) };
             0
@@ -461,16 +477,63 @@ unsafe extern "system" fn window_proc(
 fn command_from_key(key: Wparam) -> Option<WizardCommand> {
     match key {
         VK_RETURN => Some(WizardCommand::Confirm),
-        KEY_R => Some(WizardCommand::Restart),
+        KEY_R => Some(WizardCommand::Configure),
         _ => None,
     }
+}
+
+fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
+    let mut rect: Rect = unsafe { zeroed() };
+    unsafe { GetClientRect(hwnd, &mut rect) };
+
+    let x = signed_loword(lparam as usize);
+    let y = signed_hiword(lparam as usize);
+    if point_in_rect(x, y, configure_button_rect(rect)) {
+        with_wizard(|wizard| wizard.handle_command(WizardCommand::Configure));
+        return true;
+    }
+
+    false
 }
 
 fn with_wizard(action: impl FnOnce(&mut Wizard<WinmmDeviceProvider>)) {
     if let Some(lock) = STATE.get() {
         if let Ok(mut wizard) = lock.lock() {
             action(&mut wizard);
+            maybe_save_profile(&wizard);
         }
+    }
+}
+
+fn remember_saved_profile(profile: &profile::StoredProfile) {
+    let signature = profile::profile_signature(profile);
+    if let Ok(mut saved) = SAVED_PROFILE_SIGNATURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *saved = Some(signature);
+    }
+}
+
+fn maybe_save_profile(wizard: &Wizard<WinmmDeviceProvider>) {
+    let Some(profile) = wizard.profile() else {
+        return;
+    };
+
+    let signature = profile::profile_signature(&profile);
+    let Ok(mut saved_signature) = SAVED_PROFILE_SIGNATURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    else {
+        return;
+    };
+
+    if saved_signature.as_ref() == Some(&signature) {
+        return;
+    }
+
+    if profile::save_profile(&profile).is_ok() {
+        *saved_signature = Some(signature);
     }
 }
 
@@ -480,7 +543,6 @@ fn create_controls(parent: Hwnd) {
     let combo_class = wide("COMBOBOX");
     let button_class = wide("BUTTON");
     let use_device = wide("Use device");
-    let restart = wide("Restart");
 
     let device_combo = unsafe {
         CreateWindowExW(
@@ -514,39 +576,19 @@ fn create_controls(parent: Hwnd) {
             null_mut(),
         )
     };
-    let restart_button = unsafe {
-        CreateWindowExW(
-            0,
-            button_class.as_ptr(),
-            restart.as_ptr(),
-            WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | BS_PUSHBUTTON,
-            672,
-            34,
-            84,
-            30,
-            parent,
-            IDC_RESTART_BUTTON as isize,
-            h_instance,
-            null_mut(),
-        )
-    };
-
     let _ = CONTROLS.set(Mutex::new(UiControls {
         device_combo,
         primary_button,
-        restart_button,
         device_signature: Vec::new(),
         combo_selected: None,
         combo_visible: false,
         primary_visible: false,
         primary_enabled: false,
         primary_text: String::new(),
-        restart_visible: false,
     }));
 
     apply_control_style(device_combo);
     apply_control_style(primary_button);
-    apply_control_style(restart_button);
     sync_controls();
 }
 
@@ -611,9 +653,6 @@ fn handle_control_command(wparam: Wparam, lparam: Lparam) {
         (IDC_PRIMARY_BUTTON, BN_CLICKED) => {
             with_wizard(|wizard| wizard.handle_command(WizardCommand::Confirm));
         }
-        (IDC_RESTART_BUTTON, BN_CLICKED) => {
-            with_wizard(|wizard| wizard.handle_command(WizardCommand::Restart));
-        }
         _ => {}
     }
 }
@@ -647,7 +686,6 @@ fn sync_controls() {
                 &mut controls.primary_text,
                 "Use device",
             );
-            set_visible(controls.restart_button, &mut controls.restart_visible, true);
         }
         WizardStepView::Capture { role, armed, .. } => {
             set_visible(controls.device_combo, &mut controls.combo_visible, false);
@@ -663,7 +701,6 @@ fn sync_controls() {
                 format!("Capture {}", role.label())
             };
             set_window_text(controls.primary_button, &mut controls.primary_text, &text);
-            set_visible(controls.restart_button, &mut controls.restart_visible, true);
         }
         WizardStepView::Ready { .. } => {
             set_visible(controls.device_combo, &mut controls.combo_visible, false);
@@ -672,7 +709,6 @@ fn sync_controls() {
                 &mut controls.primary_visible,
                 false,
             );
-            set_visible(controls.restart_button, &mut controls.restart_visible, true);
         }
     }
 }
@@ -759,6 +795,18 @@ fn loword(value: Wparam) -> u16 {
 
 fn hiword(value: Wparam) -> u16 {
     ((value >> 16) & 0xFFFF) as u16
+}
+
+fn signed_loword(value: usize) -> i32 {
+    (value as u16) as i16 as i32
+}
+
+fn signed_hiword(value: usize) -> i32 {
+    ((value >> 16) as u16) as i16 as i32
+}
+
+fn point_in_rect(x: i32, y: i32, rect: Rect) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
 
 fn axes_from_caps(caps: &JoyCapsW) -> Vec<AxisSnapshot> {
@@ -908,6 +956,79 @@ fn draw_panel(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, color: Dword) {
     fill_rect(hdc, rect_xywh(x + width - 1, y, 1, height), color_border());
 }
 
+fn draw_hud_button(hdc: Hdc, rect: Rect, label: &str, active: bool) {
+    let fill = if active {
+        rgb(0, 168, 151)
+    } else {
+        rgb(32, 37, 47)
+    };
+    let border = if active {
+        color_accent()
+    } else {
+        rgb(74, 84, 102)
+    };
+
+    fill_rect(hdc, rect, fill);
+    fill_rect(
+        hdc,
+        rect_xywh(rect.left, rect.top, rect.right - rect.left, 1),
+        border,
+    );
+    fill_rect(
+        hdc,
+        rect_xywh(rect.left, rect.bottom - 1, rect.right - rect.left, 1),
+        border,
+    );
+    fill_rect(
+        hdc,
+        rect_xywh(rect.left, rect.top, 1, rect.bottom - rect.top),
+        border,
+    );
+    fill_rect(
+        hdc,
+        rect_xywh(rect.right - 1, rect.top, 1, rect.bottom - rect.top),
+        border,
+    );
+
+    draw_centered_text_kind(
+        hdc,
+        rect,
+        label,
+        TextKind::Body,
+        if active { rgb(6, 18, 20) } else { color_text() },
+    );
+}
+
+fn configure_button_rect(client: Rect) -> Rect {
+    let width = 104;
+    let right = (client.right - 32).max(width + 32);
+    rect_xywh(right - width, 34, width, 34)
+}
+
+fn draw_footer(hdc: Hdc, rect: Rect) {
+    let y = (rect.bottom - 34).max(0);
+    fill_rect(
+        hdc,
+        Rect {
+            left: 0,
+            top: y - 8,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+        color_app_bg(),
+    );
+    draw_text_kind(
+        hdc,
+        32,
+        y,
+        (rect.right - 64).max(0),
+        22,
+        "Esc closes  |  Configure opens setup",
+        TextKind::Meta,
+        color_muted(),
+    );
+}
+
 fn fill_rect(hdc: Hdc, rect: Rect, color: Dword) {
     let brush = unsafe { CreateSolidBrush(color) };
     unsafe {
@@ -926,11 +1047,13 @@ fn rect_xywh(x: i32, y: i32, width: i32, height: i32) -> Rect {
 }
 
 fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
+    let configure_rect = configure_button_rect(rect);
+    let header_width = (configure_rect.left - 48).max(220);
     draw_text_kind(
         hdc,
         32,
         26,
-        720,
+        header_width,
         32,
         "Apex Footwork",
         TextKind::Title,
@@ -940,7 +1063,7 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
         hdc,
         32,
         60,
-        720,
+        header_width,
         22,
         &view.status,
         TextKind::Body,
@@ -950,12 +1073,13 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
         hdc,
         32,
         84,
-        720,
+        220,
         20,
         view.step.title(),
         TextKind::Meta,
         color_accent(),
     );
+    draw_hud_button(hdc, configure_rect, "Configure", false);
 
     match &view.step {
         WizardStepView::SelectDevice {
@@ -978,18 +1102,11 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
             values,
             history,
         } => {
-            draw_ready(hdc, device, bindings, values, history);
+            draw_ready(hdc, rect, device, bindings, values, history);
         }
     }
 
-    draw_text(
-        hdc,
-        24,
-        rect.bottom - 34,
-        720,
-        22,
-        "Esc closes  |  Restart runs setup again",
-    );
+    draw_footer(hdc, rect);
 }
 
 fn draw_device_picker(hdc: Hdc, devices: &[DeviceSnapshot], _selected_index: usize) {
@@ -1043,8 +1160,9 @@ fn draw_capture_step(
 
 fn draw_ready(
     hdc: Hdc,
+    rect: Rect,
     device: &Option<DeviceSnapshot>,
-    bindings: &PedalBindings,
+    _bindings: &PedalBindings,
     values: &[(InputRole, f32)],
     history: &[(f32, f32)],
 ) {
@@ -1052,7 +1170,27 @@ fn draw_ready(
         .as_ref()
         .map(|device| device.name.as_str())
         .unwrap_or("No active device");
-    draw_text(hdc, 24, 124, 720, 22, &format!("Using: {}", device_name));
+    let content_left = 32;
+    let content_right = (rect.right - 32).max(content_left + 1);
+    let content_width = content_right - content_left;
+    let gap = 24;
+    let column_width = ((content_width - gap) / 2).max(220);
+    let right_x = content_left + column_width + gap;
+    let card_y = 166;
+    let chart_y = 286;
+    let footer_top = rect.bottom - 48;
+    let chart_height = (footer_top - chart_y - 20).max(96);
+
+    draw_text_kind(
+        hdc,
+        content_left,
+        132,
+        content_width,
+        22,
+        &format!("Input source: {}", device_name),
+        TextKind::Body,
+        color_muted(),
+    );
 
     let throttle = values
         .iter()
@@ -1063,37 +1201,44 @@ fn draw_ready(
         .find_map(|(role, value)| (*role == InputRole::Brake).then_some(*value))
         .unwrap_or(0.0);
 
-    draw_value_bar(hdc, 24, 166, 332, "Throttle", throttle, color_accent());
-    draw_value_bar(hdc, 384, 166, 332, "Brake", brake, rgb(255, 82, 96));
+    draw_value_bar(
+        hdc,
+        content_left,
+        card_y,
+        column_width,
+        "Throttle",
+        throttle,
+        color_accent(),
+    );
+    draw_value_bar(
+        hdc,
+        right_x,
+        card_y,
+        column_width,
+        "Brake",
+        brake,
+        rgb(255, 82, 96),
+    );
     draw_overlay_chart(
         hdc,
-        24,
-        314,
-        336,
-        118,
+        content_left,
+        chart_y,
+        column_width,
+        chart_height,
         "Throttle trace",
         history,
         InputRole::Throttle,
     );
     draw_overlay_chart(
         hdc,
-        384,
-        314,
-        336,
-        118,
+        right_x,
+        chart_y,
+        column_width,
+        chart_height,
         "Brake trace",
         history,
         InputRole::Brake,
     );
-    draw_text(
-        hdc,
-        24,
-        450,
-        720,
-        22,
-        "Live normalized pedal values are ready for the overlay layer.",
-    );
-    draw_binding_summary(hdc, bindings, 24, 478);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
@@ -1307,6 +1452,25 @@ fn draw_text_kind(
             (wide_text.len() - 1) as i32,
             &mut rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE,
+        );
+        if old_font != 0 {
+            SelectObject(hdc, old_font);
+        }
+    }
+}
+
+fn draw_centered_text_kind(hdc: Hdc, rect: Rect, text: &str, kind: TextKind, color: Dword) {
+    let mut rect = rect;
+    let wide_text = wide(text);
+    let old_font = select_text_font(hdc, kind);
+    unsafe {
+        SetTextColor(hdc, color);
+        DrawTextW(
+            hdc,
+            wide_text.as_ptr(),
+            (wide_text.len() - 1) as i32,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
         if old_font != 0 {
             SelectObject(hdc, old_font);

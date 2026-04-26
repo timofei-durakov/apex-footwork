@@ -1,0 +1,124 @@
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+#[derive(Clone, Debug)]
+pub struct StoredProfile {
+    pub device_id: u32,
+    pub device_name: String,
+    pub throttle: StoredBinding,
+    pub brake: StoredBinding,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredBinding {
+    pub axis_index: usize,
+    pub axis_label: String,
+    pub idle_raw: u32,
+    pub active_raw: u32,
+}
+
+pub fn load_profile() -> Option<StoredProfile> {
+    let content = fs::read_to_string(profile_path()).ok()?;
+    parse_profile(&content)
+}
+
+pub fn save_profile(profile: &StoredProfile) -> io::Result<()> {
+    let path = profile_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_profile(profile))
+}
+
+pub fn profile_signature(profile: &StoredProfile) -> String {
+    serialize_profile(profile)
+}
+
+fn profile_path() -> PathBuf {
+    let base = env::var_os("APPDATA")
+        .or_else(|| env::var_os("LOCALAPPDATA"))
+        .map(PathBuf::from)
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    base.join("ApexFootwork").join("profile.txt")
+}
+
+fn serialize_profile(profile: &StoredProfile) -> String {
+    let mut lines = Vec::new();
+    lines.push("version=1".to_string());
+    lines.push(format!("device_id={}", profile.device_id));
+    lines.push(format!("device_name={}", encode_text(&profile.device_name)));
+    push_binding(&mut lines, "throttle", &profile.throttle);
+    push_binding(&mut lines, "brake", &profile.brake);
+    lines.join("\n")
+}
+
+fn push_binding(lines: &mut Vec<String>, prefix: &str, binding: &StoredBinding) {
+    lines.push(format!("{}_axis_index={}", prefix, binding.axis_index));
+    lines.push(format!(
+        "{}_axis_label={}",
+        prefix,
+        encode_text(&binding.axis_label)
+    ));
+    lines.push(format!("{}_idle_raw={}", prefix, binding.idle_raw));
+    lines.push(format!("{}_active_raw={}", prefix, binding.active_raw));
+}
+
+fn parse_profile(content: &str) -> Option<StoredProfile> {
+    let values = content
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect::<HashMap<_, _>>();
+
+    if values.get("version")? != "1" {
+        return None;
+    }
+
+    Some(StoredProfile {
+        device_id: values.get("device_id")?.parse().ok()?,
+        device_name: decode_text(values.get("device_name")?)?,
+        throttle: parse_binding(&values, "throttle")?,
+        brake: parse_binding(&values, "brake")?,
+    })
+}
+
+fn parse_binding(values: &HashMap<String, String>, prefix: &str) -> Option<StoredBinding> {
+    Some(StoredBinding {
+        axis_index: values
+            .get(&format!("{}_axis_index", prefix))?
+            .parse()
+            .ok()?,
+        axis_label: decode_text(values.get(&format!("{}_axis_label", prefix))?)?,
+        idle_raw: values.get(&format!("{}_idle_raw", prefix))?.parse().ok()?,
+        active_raw: values
+            .get(&format!("{}_active_raw", prefix))?
+            .parse()
+            .ok()?,
+    })
+}
+
+fn encode_text(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect()
+}
+
+fn decode_text(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    for chunk in value.as_bytes().chunks(2) {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
+}
