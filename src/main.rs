@@ -52,6 +52,8 @@ const WM_COMMAND: Uint = 0x0111;
 const WM_TIMER: Uint = 0x0113;
 const WM_KEYDOWN: Uint = 0x0100;
 const WM_LBUTTONDOWN: Uint = 0x0201;
+const WM_MOUSEMOVE: Uint = 0x0200;
+const WM_LBUTTONUP: Uint = 0x0202;
 const WM_SETFONT: Uint = 0x0030;
 const VK_ESCAPE: Wparam = 0x1B;
 const VK_RETURN: Wparam = 0x0D;
@@ -231,11 +233,13 @@ unsafe extern "system" {
     fn PostQuitMessage(nExitCode: i32);
     fn RegisterClassW(lpWndClass: *const WndClassW) -> u16;
     fn SendMessageW(hWnd: Hwnd, Msg: Uint, wParam: Wparam, lParam: Lparam) -> Lresult;
+    fn SetCapture(hWnd: Hwnd) -> Hwnd;
     fn SetTimer(hWnd: Hwnd, nIDEvent: usize, uElapse: Uint, lpTimerFunc: *const c_void) -> usize;
     fn SetWindowTextW(hWnd: Hwnd, lpString: *const u16) -> Bool;
     fn ShowWindow(hWnd: Hwnd, nCmdShow: i32) -> Bool;
     fn TranslateMessage(lpMsg: *const Msg) -> Bool;
     fn UpdateWindow(hWnd: Hwnd) -> Bool;
+    fn ReleaseCapture() -> Bool;
 }
 
 #[link(name = "gdi32")]
@@ -331,6 +335,8 @@ static STATE: OnceLock<Mutex<Wizard<WinmmDeviceProvider>>> = OnceLock::new();
 static CONTROLS: OnceLock<Mutex<UiControls>> = OnceLock::new();
 static FONTS: OnceLock<UiFonts> = OnceLock::new();
 static SAVED_PROFILE_SIGNATURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static OVERLAY_SETTINGS: OnceLock<Mutex<OverlaySettings>> = OnceLock::new();
+static RESIZE_DRAG: OnceLock<Mutex<Option<ResizeDrag>>> = OnceLock::new();
 
 struct UiFonts {
     title: Hfont,
@@ -350,7 +356,46 @@ struct UiControls {
     primary_text: String,
 }
 
+#[derive(Clone, Copy)]
+struct OverlaySettings {
+    chart_width: i32,
+    chart_height: i32,
+    chart_opacity: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    start_x: i32,
+    start_y: i32,
+    start_width: i32,
+    start_height: i32,
+}
+
+#[derive(Clone, Copy)]
+struct OverlayLayout {
+    content_left: i32,
+    content_width: i32,
+    right_x: i32,
+    column_width: i32,
+    card_y: i32,
+    controls_y: i32,
+    chart: Rect,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            chart_width: 0,
+            chart_height: 168,
+            chart_opacity: 0.9,
+        }
+    }
+}
+
 fn main() {
+    OVERLAY_SETTINGS.get_or_init(|| Mutex::new(OverlaySettings::default()));
+    RESIZE_DRAG.get_or_init(|| Mutex::new(None));
+
     let mut wizard = Wizard::new(WinmmDeviceProvider);
     if let Some(saved_profile) = profile::load_profile() {
         if wizard.restore_profile(&saved_profile) {
@@ -450,6 +495,23 @@ unsafe extern "system" fn window_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_MOUSEMOVE => {
+            if handle_mouse_move(hwnd, lparam) {
+                unsafe { InvalidateRect(hwnd, null(), 0) };
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_LBUTTONUP => {
+            if finish_resize_drag() {
+                unsafe {
+                    ReleaseCapture();
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_KEYDOWN if wparam == VK_ESCAPE => {
             unsafe { DestroyWindow(hwnd) };
             0
@@ -493,7 +555,125 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
         return true;
     }
 
+    if start_resize_drag(hwnd, rect, x, y) {
+        return true;
+    }
+
+    if handle_overlay_settings_click(rect, x, y) {
+        return true;
+    }
+
     false
+}
+
+fn handle_mouse_move(client_hwnd: Hwnd, lparam: Lparam) -> bool {
+    let is_dragging = RESIZE_DRAG
+        .get()
+        .and_then(|lock| lock.lock().ok().map(|drag| drag.is_some()))
+        .unwrap_or(false);
+    if !is_dragging {
+        return false;
+    }
+
+    let x = signed_loword(lparam as usize);
+    let y = signed_hiword(lparam as usize);
+    let mut rect: Rect = unsafe { zeroed() };
+    unsafe { GetClientRect(client_hwnd, &mut rect) };
+    resize_chart_to_mouse(rect, x, y);
+    true
+}
+
+fn start_resize_drag(hwnd: Hwnd, client: Rect, x: i32, y: i32) -> bool {
+    if !is_ready_view() {
+        return false;
+    }
+
+    let settings = overlay_settings();
+    let layout = overlay_layout(client, settings);
+    if !point_in_rect(x, y, chart_resize_handle_rect(layout.chart)) {
+        return false;
+    }
+
+    if let Ok(mut drag) = RESIZE_DRAG.get_or_init(|| Mutex::new(None)).lock() {
+        *drag = Some(ResizeDrag {
+            start_x: x,
+            start_y: y,
+            start_width: layout.chart.right - layout.chart.left,
+            start_height: layout.chart.bottom - layout.chart.top,
+        });
+    }
+    unsafe { SetCapture(hwnd) };
+    true
+}
+
+fn resize_chart_to_mouse(client: Rect, x: i32, y: i32) {
+    let drag = {
+        let Ok(drag) = RESIZE_DRAG.get_or_init(|| Mutex::new(None)).lock() else {
+            return;
+        };
+        let Some(drag) = *drag else {
+            return;
+        };
+        drag
+    };
+
+    let footer_top = client.bottom - 48;
+    let max_width = (client.right - 64).max(260);
+    let max_height = (footer_top - 308 - 20).max(96).min(360);
+    let new_width = (drag.start_width + (x - drag.start_x)).clamp(260, max_width);
+    let new_height = (drag.start_height + (y - drag.start_y)).clamp(96, max_height);
+
+    if let Some(settings_lock) = OVERLAY_SETTINGS.get() {
+        if let Ok(mut settings) = settings_lock.lock() {
+            settings.chart_width = new_width;
+            settings.chart_height = new_height;
+        }
+    }
+}
+
+fn finish_resize_drag() -> bool {
+    let Some(lock) = RESIZE_DRAG.get() else {
+        return false;
+    };
+    let Ok(mut drag) = lock.lock() else {
+        return false;
+    };
+    let was_dragging = drag.is_some();
+    *drag = None;
+    was_dragging
+}
+
+fn handle_overlay_settings_click(client: Rect, x: i32, y: i32) -> bool {
+    let Some(view) = current_view() else {
+        return false;
+    };
+    if !matches!(view.step, WizardStepView::Ready { .. }) {
+        return false;
+    }
+
+    let Some(lock) = OVERLAY_SETTINGS.get() else {
+        return false;
+    };
+    let Ok(mut settings) = lock.lock() else {
+        return false;
+    };
+
+    if point_in_rect(x, y, chart_opacity_minus_rect(client)) {
+        settings.chart_opacity = (settings.chart_opacity - 0.1).max(0.3);
+        return true;
+    }
+    if point_in_rect(x, y, chart_opacity_plus_rect(client)) {
+        settings.chart_opacity = (settings.chart_opacity + 0.1).min(1.0);
+        return true;
+    }
+
+    false
+}
+
+fn is_ready_view() -> bool {
+    current_view()
+        .map(|view| matches!(view.step, WizardStepView::Ready { .. }))
+        .unwrap_or(false)
 }
 
 fn with_wizard(action: impl FnOnce(&mut Wizard<WinmmDeviceProvider>)) {
@@ -945,15 +1125,27 @@ fn draw_shell(hdc: Hdc, rect: Rect) {
 }
 
 fn draw_panel(hdc: Hdc, x: i32, y: i32, width: i32, height: i32, color: Dword) {
+    draw_panel_with_border(hdc, x, y, width, height, color, color_border());
+}
+
+fn draw_panel_with_border(
+    hdc: Hdc,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: Dword,
+    border: Dword,
+) {
     if width <= 0 || height <= 0 {
         return;
     }
 
     fill_rect(hdc, rect_xywh(x, y, width, height), color);
-    fill_rect(hdc, rect_xywh(x, y, width, 1), color_border());
-    fill_rect(hdc, rect_xywh(x, y + height - 1, width, 1), color_border());
-    fill_rect(hdc, rect_xywh(x, y, 1, height), color_border());
-    fill_rect(hdc, rect_xywh(x + width - 1, y, 1, height), color_border());
+    fill_rect(hdc, rect_xywh(x, y, width, 1), border);
+    fill_rect(hdc, rect_xywh(x, y + height - 1, width, 1), border);
+    fill_rect(hdc, rect_xywh(x, y, 1, height), border);
+    fill_rect(hdc, rect_xywh(x + width - 1, y, 1, height), border);
 }
 
 fn draw_hud_button(hdc: Hdc, rect: Rect, label: &str, active: bool) {
@@ -1003,6 +1195,18 @@ fn configure_button_rect(client: Rect) -> Rect {
     let width = 104;
     let right = (client.right - 32).max(width + 32);
     rect_xywh(right - width, 34, width, 34)
+}
+
+fn chart_opacity_minus_rect(_client: Rect) -> Rect {
+    rect_xywh(390, 268, 34, 28)
+}
+
+fn chart_opacity_plus_rect(_client: Rect) -> Rect {
+    rect_xywh(430, 268, 34, 28)
+}
+
+fn chart_resize_handle_rect(chart: Rect) -> Rect {
+    rect_xywh(chart.right - 28, chart.bottom - 28, 22, 22)
 }
 
 fn draw_footer(hdc: Hdc, rect: Rect) {
@@ -1170,22 +1374,14 @@ fn draw_ready(
         .as_ref()
         .map(|device| device.name.as_str())
         .unwrap_or("No active device");
-    let content_left = 32;
-    let content_right = (rect.right - 32).max(content_left + 1);
-    let content_width = content_right - content_left;
-    let gap = 24;
-    let column_width = ((content_width - gap) / 2).max(220);
-    let right_x = content_left + column_width + gap;
-    let card_y = 166;
-    let chart_y = 286;
-    let footer_top = rect.bottom - 48;
-    let chart_height = (footer_top - chart_y - 20).max(96);
+    let settings = overlay_settings();
+    let layout = overlay_layout(rect, settings);
 
     draw_text_kind(
         hdc,
-        content_left,
+        layout.content_left,
         132,
-        content_width,
+        layout.content_width,
         22,
         &format!("Input source: {}", device_name),
         TextKind::Body,
@@ -1203,42 +1399,24 @@ fn draw_ready(
 
     draw_value_bar(
         hdc,
-        content_left,
-        card_y,
-        column_width,
+        layout.content_left,
+        layout.card_y,
+        layout.column_width,
         "Throttle",
         throttle,
         color_accent(),
     );
     draw_value_bar(
         hdc,
-        right_x,
-        card_y,
-        column_width,
+        layout.right_x,
+        layout.card_y,
+        layout.column_width,
         "Brake",
         brake,
         rgb(255, 82, 96),
     );
-    draw_overlay_chart(
-        hdc,
-        content_left,
-        chart_y,
-        column_width,
-        chart_height,
-        "Throttle trace",
-        history,
-        InputRole::Throttle,
-    );
-    draw_overlay_chart(
-        hdc,
-        right_x,
-        chart_y,
-        column_width,
-        chart_height,
-        "Brake trace",
-        history,
-        InputRole::Brake,
-    );
+    draw_overlay_controls(hdc, rect, settings, layout.controls_y);
+    draw_combined_overlay_chart(hdc, layout.chart, history, settings.chart_opacity);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
@@ -1262,29 +1440,96 @@ fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
     draw_binding_line(hdc, x, y + 58, InputRole::Brake, bindings.brake.as_ref());
 }
 
-fn draw_overlay_chart(
-    hdc: Hdc,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    label: &str,
-    history: &[(f32, f32)],
-    role: InputRole,
-) {
-    draw_panel(hdc, x, y, width, height, color_panel_raised());
+fn draw_overlay_controls(hdc: Hdc, client: Rect, settings: OverlaySettings, y: i32) {
     draw_text_kind(
         hdc,
-        x + 14,
-        y + 10,
-        width - 28,
+        32,
+        y + 5,
+        220,
         20,
-        label,
-        TextKind::Heading,
-        color_text(),
+        "Resize graph by dragging its corner",
+        TextKind::Meta,
+        color_muted(),
     );
 
-    let plot = rect_xywh(x + 14, y + 38, width - 28, height - 54);
+    draw_text_kind(
+        hdc,
+        284,
+        y + 5,
+        92,
+        20,
+        &format!("Opacity {:.0}%", settings.chart_opacity * 100.0),
+        TextKind::Meta,
+        color_muted(),
+    );
+    draw_hud_button(hdc, chart_opacity_minus_rect(client), "-", false);
+    draw_hud_button(hdc, chart_opacity_plus_rect(client), "+", false);
+}
+
+fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
+    let content_left = 32;
+    let content_right = (client.right - 32).max(content_left + 1);
+    let content_width = content_right - content_left;
+    let gap = 24;
+    let column_width = ((content_width - gap) / 2).max(220);
+    let right_x = content_left + column_width + gap;
+    let card_y = 166;
+    let controls_y = 268;
+    let chart_y = 316;
+    let footer_top = client.bottom - 48;
+    let available_chart_height = (footer_top - chart_y - 20).max(96);
+    let chart_width = visible_chart_width(client, settings);
+    let chart_height = settings.chart_height.min(available_chart_height).max(96);
+
+    OverlayLayout {
+        content_left,
+        content_width,
+        right_x,
+        column_width,
+        card_y,
+        controls_y,
+        chart: rect_xywh(content_left, chart_y, chart_width, chart_height),
+    }
+}
+
+fn visible_chart_width(client: Rect, settings: OverlaySettings) -> i32 {
+    let content_width = (client.right - 64).max(260);
+    let desired_width = if settings.chart_width <= 0 {
+        content_width
+    } else {
+        settings.chart_width
+    };
+    desired_width.clamp(260, content_width)
+}
+
+fn draw_combined_overlay_chart(hdc: Hdc, chart: Rect, history: &[(f32, f32)], opacity: f32) {
+    let x = chart.left;
+    let y = chart.top;
+    let width = chart.right - chart.left;
+    let height = chart.bottom - chart.top;
+    let opacity = opacity.clamp(0.3, 1.0);
+    draw_panel_with_border(
+        hdc,
+        x,
+        y,
+        width,
+        height,
+        blend_colors(color_app_bg(), color_panel_raised(), opacity),
+        blend_colors(color_app_bg(), color_border(), opacity),
+    );
+
+    if width >= 420 {
+        draw_legend(hdc, x + 14, y + 12, opacity);
+    }
+    draw_resize_grip(hdc, chart, opacity);
+
+    let top_padding = if width >= 420 { 42 } else { 18 };
+    let plot = rect_xywh(
+        x + 14,
+        y + top_padding,
+        width - 28,
+        height - top_padding - 16,
+    );
     for i in 0..=3 {
         let grid_y = plot.top + ((plot.bottom - plot.top) * i / 3);
         fill_rect(
@@ -1295,7 +1540,7 @@ fn draw_overlay_chart(
                 right: plot.right,
                 bottom: grid_y + 1,
             },
-            rgb(40, 46, 57),
+            blend_colors(color_app_bg(), rgb(44, 51, 64), opacity),
         );
     }
 
@@ -1308,16 +1553,70 @@ fn draw_overlay_chart(
             20,
             "Waiting for input",
             TextKind::Meta,
-            color_muted(),
+            blend_colors(color_app_bg(), color_muted(), opacity),
         );
         return;
     }
 
-    let color = match role {
-        InputRole::Throttle => color_accent(),
-        InputRole::Brake => rgb(255, 82, 96),
-    };
-    draw_history_line(hdc, plot, history, role, color);
+    draw_history_line(
+        hdc,
+        plot,
+        history,
+        InputRole::Throttle,
+        blend_colors(color_app_bg(), color_accent(), opacity),
+    );
+    draw_history_line(
+        hdc,
+        plot,
+        history,
+        InputRole::Brake,
+        blend_colors(color_app_bg(), rgb(255, 82, 96), opacity),
+    );
+}
+
+fn draw_resize_grip(hdc: Hdc, chart: Rect, opacity: f32) {
+    let grip = chart_resize_handle_rect(chart);
+    let color = blend_colors(color_app_bg(), color_muted(), opacity);
+    for offset in [6, 11, 16] {
+        let x1 = grip.right - offset;
+        let y1 = grip.bottom - 4;
+        let x2 = grip.right - 4;
+        let y2 = grip.bottom - offset;
+        draw_line(hdc, x1, y1, x2, y2, color, 1);
+    }
+}
+
+fn draw_line(hdc: Hdc, x1: i32, y1: i32, x2: i32, y2: i32, color: Dword, width: i32) {
+    let pen = unsafe { CreatePen(PS_SOLID, width, color) };
+    let old_pen = unsafe { SelectObject(hdc, pen) };
+    unsafe {
+        MoveToEx(hdc, x1, y1, null_mut());
+        LineTo(hdc, x2, y2);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen);
+    }
+}
+
+fn draw_legend(hdc: Hdc, x: i32, y: i32, opacity: f32) {
+    draw_legend_item(
+        hdc,
+        x,
+        y,
+        "Throttle",
+        blend_colors(color_app_bg(), color_accent(), opacity),
+    );
+    draw_legend_item(
+        hdc,
+        x + 104,
+        y,
+        "Brake",
+        blend_colors(color_app_bg(), rgb(255, 82, 96), opacity),
+    );
+}
+
+fn draw_legend_item(hdc: Hdc, x: i32, y: i32, label: &str, color: Dword) {
+    fill_rect(hdc, rect_xywh(x, y + 8, 24, 3), color);
+    draw_text_kind(hdc, x + 32, y, 72, 20, label, TextKind::Meta, color_muted());
 }
 
 fn draw_history_line(hdc: Hdc, plot: Rect, history: &[(f32, f32)], role: InputRole, color: Dword) {
@@ -1491,6 +1790,14 @@ fn select_text_font(hdc: Hdc, kind: TextKind) -> Hgdiobj {
     unsafe { SelectObject(hdc, font as Hgdiobj) }
 }
 
+fn overlay_settings() -> OverlaySettings {
+    OVERLAY_SETTINGS
+        .get_or_init(|| Mutex::new(OverlaySettings::default()))
+        .lock()
+        .map(|settings| *settings)
+        .unwrap_or_default()
+}
+
 fn color_app_bg() -> Dword {
     rgb(14, 16, 20)
 }
@@ -1521,6 +1828,21 @@ fn color_accent() -> Dword {
 
 fn color_track() -> Dword {
     rgb(48, 55, 66)
+}
+
+fn blend_colors(background: Dword, foreground: Dword, alpha: f32) -> Dword {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let br = background & 0xFF;
+    let bg = (background >> 8) & 0xFF;
+    let bb = (background >> 16) & 0xFF;
+    let fr = foreground & 0xFF;
+    let fg = (foreground >> 8) & 0xFF;
+    let fb = (foreground >> 16) & 0xFF;
+
+    let r = br as f32 + (fr as f32 - br as f32) * alpha;
+    let g = bg as f32 + (fg as f32 - bg as f32) * alpha;
+    let b = bb as f32 + (fb as f32 - bb as f32) * alpha;
+    rgb(r.round() as u8, g.round() as u8, b.round() as u8)
 }
 
 fn name_from_wide(chars: &[u16]) -> String {
