@@ -1,4 +1,4 @@
-use crate::profile::{StoredBinding, StoredProfile};
+use crate::profile::{StoredBinding, StoredCalibration, StoredProfile};
 
 #[derive(Clone, Debug)]
 pub struct AxisSnapshot {
@@ -62,6 +62,13 @@ pub struct BindingView {
     pub axis_label: &'static str,
     pub idle_raw: u32,
     pub active_raw: u32,
+    pub calibration: BindingCalibration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindingCalibration {
+    DriverRange,
+    CustomRange { idle_raw: u32, active_raw: u32 },
 }
 
 impl BindingView {
@@ -70,15 +77,37 @@ impl BindingView {
             return 0.0;
         };
 
-        let idle = self.idle_raw as f32;
-        let active = self.active_raw as f32;
-        let raw = axis.raw as f32;
+        match self.calibration {
+            BindingCalibration::DriverRange => self.driver_range_value(axis),
+            BindingCalibration::CustomRange {
+                idle_raw,
+                active_raw,
+            } => Self::raw_span_value(axis.raw, idle_raw, active_raw),
+        }
+    }
+
+    fn driver_range_value(&self, axis: &AxisSnapshot) -> f32 {
+        if axis.max <= axis.min || self.idle_raw == self.active_raw {
+            return 0.0;
+        }
+
+        let normalized = Self::raw_span_value(axis.raw, axis.min, axis.max);
+        if self.active_raw > self.idle_raw {
+            normalized
+        } else {
+            1.0 - normalized
+        }
+    }
+
+    fn raw_span_value(raw: u32, idle_raw: u32, active_raw: u32) -> f32 {
+        let idle = idle_raw as f32;
+        let active = active_raw as f32;
         let span = active - idle;
         if span.abs() < 1.0 {
             return 0.0;
         }
 
-        ((raw - idle) / span).clamp(0.0, 1.0)
+        ((raw as f32 - idle) / span).clamp(0.0, 1.0)
     }
 }
 
@@ -100,6 +129,7 @@ pub enum WizardCommand {
     SelectDevice(usize),
     Confirm,
     Configure,
+    ToggleAdvancedCalibration,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +141,7 @@ pub enum WizardStepView {
     Capture {
         role: InputRole,
         armed: bool,
+        advanced_calibration: bool,
         device: Option<DeviceSnapshot>,
         bindings: PedalBindings,
     },
@@ -171,6 +202,34 @@ enum WizardStep {
 const CAPTURE_START_THRESHOLD: f32 = 0.18;
 const CAPTURE_RELEASE_THRESHOLD: f32 = 0.06;
 
+fn capture_prompt(role: InputRole, advanced_calibration: bool) -> String {
+    if advanced_calibration {
+        format!(
+            "Press {} fully, then release it. This saves an advanced custom 0-100% range.",
+            role.label()
+        )
+    } else {
+        format!(
+            "Press {} once, then release it. This detects the axis and direction.",
+            role.label()
+        )
+    }
+}
+
+fn capture_detected_prompt(role: InputRole, advanced_calibration: bool) -> String {
+    if advanced_calibration {
+        format!(
+            "{} movement detected. Release the pedal to save the custom range.",
+            role.label()
+        )
+    } else {
+        format!(
+            "{} movement detected. Release the pedal to save the binding.",
+            role.label()
+        )
+    }
+}
+
 pub struct Wizard<P: DeviceProvider> {
     provider: P,
     devices: Vec<DeviceSnapshot>,
@@ -181,6 +240,7 @@ pub struct Wizard<P: DeviceProvider> {
     value_history: Vec<(f32, f32)>,
     status: String,
     tick: u32,
+    advanced_calibration: bool,
 }
 
 impl<P: DeviceProvider> Wizard<P> {
@@ -202,6 +262,7 @@ impl<P: DeviceProvider> Wizard<P> {
             value_history: Vec::new(),
             status,
             tick: 0,
+            advanced_calibration: false,
         }
     }
 
@@ -240,10 +301,7 @@ impl<P: DeviceProvider> Wizard<P> {
                     {
                         *current = Some(candidate);
                     }
-                    self.status = format!(
-                        "{} movement detected. Release the pedal to save the full press.",
-                        role.label()
-                    );
+                    self.status = capture_detected_prompt(role, self.advanced_calibration);
                 }
                 CaptureUpdate::Finished(binding) => {
                     self.finish_binding(binding);
@@ -261,6 +319,7 @@ impl<P: DeviceProvider> Wizard<P> {
             }
             WizardCommand::Confirm => self.confirm(),
             WizardCommand::Configure => self.configure(),
+            WizardCommand::ToggleAdvancedCalibration => self.toggle_advanced_calibration(),
             _ => {}
         }
     }
@@ -274,6 +333,7 @@ impl<P: DeviceProvider> Wizard<P> {
             WizardStep::Capture { role, armed, .. } => WizardStepView::Capture {
                 role: *role,
                 armed: *armed,
+                advanced_calibration: self.advanced_calibration,
                 device: self.active_device.clone(),
                 bindings: self.bindings.clone(),
             },
@@ -366,8 +426,22 @@ impl<P: DeviceProvider> Wizard<P> {
         self.active_device = None;
         self.bindings = PedalBindings::default();
         self.value_history.clear();
+        self.advanced_calibration = false;
         self.step = WizardStep::SelectDevice;
         self.refresh_devices();
+    }
+
+    fn toggle_advanced_calibration(&mut self) {
+        let WizardStep::Capture { armed: false, .. } = self.step else {
+            return;
+        };
+
+        self.advanced_calibration = !self.advanced_calibration;
+        self.status = if self.advanced_calibration {
+            "Advanced calibration enabled. Capture will save a custom 0-100% range.".to_string()
+        } else {
+            "Advanced calibration disabled. Driver range will be used for 0-100%.".to_string()
+        };
     }
 
     fn refresh_devices(&mut self) {
@@ -415,6 +489,7 @@ impl<P: DeviceProvider> Wizard<P> {
         self.poll_active_device();
         self.bindings = PedalBindings::default();
         self.value_history.clear();
+        self.advanced_calibration = false;
         self.step = WizardStep::Capture {
             role: InputRole::Throttle,
             armed: false,
@@ -439,10 +514,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 baseline,
                 candidate: None,
             };
-            self.status = format!(
-                "Press {} fully, then release it. The peak will become 100%.",
-                role.label()
-            );
+            self.status = capture_prompt(role, self.advanced_calibration);
         }
     }
 
@@ -502,13 +574,23 @@ impl<P: DeviceProvider> Wizard<P> {
         }
 
         let axis = &device.axes[axis_index];
+        let idle_raw = baseline[axis_index];
+        let active_raw = axis.raw;
         Some((
             BindingView {
                 role,
                 axis_index,
                 axis_label: axis.label,
-                idle_raw: baseline[axis_index],
-                active_raw: axis.raw,
+                idle_raw,
+                active_raw,
+                calibration: if self.advanced_calibration {
+                    BindingCalibration::CustomRange {
+                        idle_raw,
+                        active_raw,
+                    }
+                } else {
+                    BindingCalibration::DriverRange
+                },
             },
             magnitude,
         ))
@@ -593,6 +675,7 @@ impl<P: DeviceProvider> Wizard<P> {
             axis_label: axis.label,
             idle_raw: stored.idle_raw,
             active_raw: stored.active_raw,
+            calibration: Self::calibration_from_profile(&stored.calibration)?,
         })
     }
 
@@ -602,6 +685,34 @@ impl<P: DeviceProvider> Wizard<P> {
             axis_label: binding.axis_label.to_string(),
             idle_raw: binding.idle_raw,
             active_raw: binding.active_raw,
+            calibration: Self::calibration_to_profile(&binding.calibration),
+        }
+    }
+
+    fn calibration_from_profile(stored: &StoredCalibration) -> Option<BindingCalibration> {
+        match stored {
+            StoredCalibration::DriverRange => Some(BindingCalibration::DriverRange),
+            StoredCalibration::CustomRange {
+                idle_raw,
+                active_raw,
+            } if idle_raw != active_raw => Some(BindingCalibration::CustomRange {
+                idle_raw: *idle_raw,
+                active_raw: *active_raw,
+            }),
+            StoredCalibration::CustomRange { .. } => None,
+        }
+    }
+
+    fn calibration_to_profile(calibration: &BindingCalibration) -> StoredCalibration {
+        match calibration {
+            BindingCalibration::DriverRange => StoredCalibration::DriverRange,
+            BindingCalibration::CustomRange {
+                idle_raw,
+                active_raw,
+            } => StoredCalibration::CustomRange {
+                idle_raw: *idle_raw,
+                active_raw: *active_raw,
+            },
         }
     }
 
@@ -711,12 +822,14 @@ mod tests {
                 axis_label: "X".to_string(),
                 idle_raw: 0,
                 active_raw: 1000,
+                calibration: StoredCalibration::DriverRange,
             },
             brake: StoredBinding {
                 axis_index: 1,
                 axis_label: "Y".to_string(),
                 idle_raw: 1000,
                 active_raw: 0,
+                calibration: StoredCalibration::DriverRange,
             },
         }
     }
@@ -737,11 +850,32 @@ mod tests {
             axis_label: "Y",
             idle_raw: 900,
             active_raw: 100,
+            calibration: BindingCalibration::DriverRange,
         };
 
         assert_near(binding.value(&[AxisSnapshot::new("Y", 0, 1000, 500)]), 0.5);
         assert_near(binding.value(&[AxisSnapshot::new("Y", 0, 1000, 1000)]), 0.0);
         assert_near(binding.value(&[AxisSnapshot::new("Y", 0, 1000, 0)]), 1.0);
+    }
+
+    #[test]
+    fn binding_value_supports_advanced_custom_calibration() {
+        let binding = BindingView {
+            role: InputRole::Throttle,
+            axis_index: 0,
+            axis_label: "X",
+            idle_raw: 0,
+            active_raw: 1000,
+            calibration: BindingCalibration::CustomRange {
+                idle_raw: 100,
+                active_raw: 700,
+            },
+        };
+
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 100)]), 0.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 400)]), 0.5);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 700)]), 1.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 900)]), 1.0);
     }
 
     #[test]
@@ -757,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_flow_uses_peak_as_full_scale() {
+    fn capture_flow_uses_driver_range_not_capture_peak() {
         let provider = TestProvider::new(vec![test_device(7, "Test Pedals", &[0, 0])], &[0, 0]);
         let mut wizard = Wizard::new(provider.clone());
 
@@ -783,18 +917,84 @@ mod tests {
         assert_eq!(profile.brake.idle_raw, 0);
         assert_eq!(profile.brake.active_raw, 760);
 
-        provider.set_axes(&[310, 380]);
+        provider.set_axes(&[620, 760]);
         wizard.update();
 
         match wizard.view().step {
             WizardStepView::Ready {
                 values, history, ..
             } => {
+                assert_near(value_for(&values, InputRole::Throttle), 0.62);
+                assert_near(value_for(&values, InputRole::Brake), 0.76);
+                assert_eq!(history.len(), 1);
+                assert_near(history[0].0, 0.62);
+                assert_near(history[0].1, 0.76);
+            }
+            _ => panic!("expected ready state"),
+        }
+
+        provider.set_axes(&[1000, 1000]);
+        wizard.update();
+
+        match wizard.view().step {
+            WizardStepView::Ready { values, .. } => {
+                assert_near(value_for(&values, InputRole::Throttle), 1.0);
+                assert_near(value_for(&values, InputRole::Brake), 1.0);
+            }
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn advanced_calibration_saves_custom_range() {
+        let provider = TestProvider::new(vec![test_device(7, "Test Pedals", &[0, 0])], &[0, 0]);
+        let mut wizard = Wizard::new(provider.clone());
+
+        wizard.handle_command(WizardCommand::Confirm);
+        wizard.handle_command(WizardCommand::ToggleAdvancedCalibration);
+        match wizard.view().step {
+            WizardStepView::Capture {
+                advanced_calibration,
+                ..
+            } => assert!(advanced_calibration),
+            _ => panic!("expected capture state"),
+        }
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[600, 0]);
+        wizard.update();
+        provider.set_axes(&[0, 0]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 800]);
+        wizard.update();
+        provider.set_axes(&[0, 0]);
+        wizard.update();
+
+        let profile = wizard.profile().unwrap();
+        assert_eq!(
+            profile.throttle.calibration,
+            StoredCalibration::CustomRange {
+                idle_raw: 0,
+                active_raw: 600
+            }
+        );
+        assert_eq!(
+            profile.brake.calibration,
+            StoredCalibration::CustomRange {
+                idle_raw: 0,
+                active_raw: 800
+            }
+        );
+
+        provider.set_axes(&[300, 400]);
+        wizard.update();
+
+        match wizard.view().step {
+            WizardStepView::Ready { values, .. } => {
                 assert_near(value_for(&values, InputRole::Throttle), 0.5);
                 assert_near(value_for(&values, InputRole::Brake), 0.5);
-                assert_eq!(history.len(), 1);
-                assert_near(history[0].0, 0.5);
-                assert_near(history[0].1, 0.5);
             }
             _ => panic!("expected ready state"),
         }

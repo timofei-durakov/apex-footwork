@@ -18,6 +18,13 @@ pub struct StoredBinding {
     pub axis_label: String,
     pub idle_raw: u32,
     pub active_raw: u32,
+    pub calibration: StoredCalibration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredCalibration {
+    DriverRange,
+    CustomRange { idle_raw: u32, active_raw: u32 },
 }
 
 pub fn load_profile() -> Option<StoredProfile> {
@@ -66,6 +73,19 @@ fn push_binding(lines: &mut Vec<String>, prefix: &str, binding: &StoredBinding) 
     ));
     lines.push(format!("{}_idle_raw={}", prefix, binding.idle_raw));
     lines.push(format!("{}_active_raw={}", prefix, binding.active_raw));
+    match &binding.calibration {
+        StoredCalibration::DriverRange => {
+            lines.push(format!("{}_calibration=driver_range", prefix));
+        }
+        StoredCalibration::CustomRange {
+            idle_raw,
+            active_raw,
+        } => {
+            lines.push(format!("{}_calibration=custom_range", prefix));
+            lines.push(format!("{}_calibration_idle_raw={}", prefix, idle_raw));
+            lines.push(format!("{}_calibration_active_raw={}", prefix, active_raw));
+        }
+    }
 }
 
 fn parse_profile(content: &str) -> Option<StoredProfile> {
@@ -99,7 +119,29 @@ fn parse_binding(values: &HashMap<String, String>, prefix: &str) -> Option<Store
             .get(&format!("{}_active_raw", prefix))?
             .parse()
             .ok()?,
+        calibration: parse_calibration(values, prefix)?,
     })
+}
+
+fn parse_calibration(values: &HashMap<String, String>, prefix: &str) -> Option<StoredCalibration> {
+    match values
+        .get(&format!("{}_calibration", prefix))
+        .map(String::as_str)
+        .unwrap_or("driver_range")
+    {
+        "driver_range" => Some(StoredCalibration::DriverRange),
+        "custom_range" => Some(StoredCalibration::CustomRange {
+            idle_raw: values
+                .get(&format!("{}_calibration_idle_raw", prefix))?
+                .parse()
+                .ok()?,
+            active_raw: values
+                .get(&format!("{}_calibration_active_raw", prefix))?
+                .parse()
+                .ok()?,
+        }),
+        _ => None,
+    }
 }
 
 fn encode_text(value: &str) -> String {
@@ -136,12 +178,17 @@ mod tests {
                 axis_label: "X axis".to_string(),
                 idle_raw: 101,
                 active_raw: 801,
+                calibration: StoredCalibration::DriverRange,
             },
             brake: StoredBinding {
                 axis_index: 2,
                 axis_label: "Z axis".to_string(),
                 idle_raw: 900,
                 active_raw: 120,
+                calibration: StoredCalibration::CustomRange {
+                    idle_raw: 920,
+                    active_raw: 140,
+                },
             },
         }
     }
@@ -173,6 +220,30 @@ mod tests {
         let content = serialize_profile(&sample_profile())
             .lines()
             .filter(|line| !line.starts_with("brake_active_raw="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(parse_profile(&content), None);
+    }
+
+    #[test]
+    fn parser_defaults_old_profiles_to_driver_range() {
+        let content = serialize_profile(&sample_profile())
+            .lines()
+            .filter(|line| !line.contains("_calibration"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let profile = parse_profile(&content).unwrap();
+
+        assert_eq!(profile.throttle.calibration, StoredCalibration::DriverRange);
+        assert_eq!(profile.brake.calibration, StoredCalibration::DriverRange);
+    }
+
+    #[test]
+    fn parser_rejects_incomplete_custom_calibration() {
+        let content = serialize_profile(&sample_profile())
+            .lines()
+            .filter(|line| !line.starts_with("brake_calibration_active_raw="))
             .collect::<Vec<_>>()
             .join("\n");
 

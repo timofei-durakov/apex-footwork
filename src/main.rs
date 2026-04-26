@@ -8,8 +8,8 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
 use wizard::{
-    AxisSnapshot, BindingView, DeviceProvider, DeviceSnapshot, InputRole, PedalBindings, Wizard,
-    WizardCommand, WizardStepView, WizardView,
+    AxisSnapshot, BindingCalibration, BindingView, DeviceProvider, DeviceSnapshot, InputRole,
+    PedalBindings, Wizard, WizardCommand, WizardStepView, WizardView,
 };
 
 type Bool = i32;
@@ -246,7 +246,6 @@ unsafe extern "system" {
     fn SetCapture(hWnd: Hwnd) -> Hwnd;
     fn SetLayeredWindowAttributes(hwnd: Hwnd, crKey: Dword, bAlpha: u8, dwFlags: Dword) -> Bool;
     fn SetTimer(hWnd: Hwnd, nIDEvent: usize, uElapse: Uint, lpTimerFunc: *const c_void) -> usize;
-    fn SetWindowTextW(hWnd: Hwnd, lpString: *const u16) -> Bool;
     fn ShowWindow(hWnd: Hwnd, nCmdShow: i32) -> Bool;
     fn TranslateMessage(lpMsg: *const Msg) -> Bool;
     fn UpdateWindow(hWnd: Hwnd) -> Bool;
@@ -365,7 +364,6 @@ struct UiControls {
     combo_visible: bool,
     primary_visible: bool,
     primary_enabled: bool,
-    primary_text: String,
 }
 
 #[derive(Clone, Copy)]
@@ -392,6 +390,16 @@ struct OverlayLayout {
     card_y: i32,
     controls_y: i32,
     chart: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureLayout {
+    left: i32,
+    button: Rect,
+    advanced_toggle: Rect,
+    advanced_description: Rect,
+    axes_panel: Rect,
+    binding_panel: Rect,
 }
 
 impl Default for OverlaySettings {
@@ -780,6 +788,14 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
         return true;
     }
 
+    if handle_primary_action_click(rect, x, y) {
+        return true;
+    }
+
+    if handle_capture_settings_click(rect, x, y) {
+        return true;
+    }
+
     if start_resize_drag(hwnd, rect, x, y) {
         return true;
     }
@@ -789,6 +805,46 @@ fn handle_mouse_down(hwnd: Hwnd, lparam: Lparam) -> bool {
     }
 
     false
+}
+
+fn handle_primary_action_click(client: Rect, x: i32, y: i32) -> bool {
+    let Some(view) = current_view() else {
+        return false;
+    };
+
+    match view.step {
+        WizardStepView::SelectDevice { devices, .. } => {
+            if devices.is_empty() || !point_in_rect(x, y, select_primary_button_rect(client)) {
+                return false;
+            }
+        }
+        WizardStepView::Capture { armed, .. } => {
+            if armed || !point_in_rect(x, y, capture_layout(client).button) {
+                return false;
+            }
+        }
+        WizardStepView::Ready { .. } => return false,
+    }
+
+    with_wizard(|wizard| wizard.handle_command(WizardCommand::Confirm));
+    true
+}
+
+fn handle_capture_settings_click(client: Rect, x: i32, y: i32) -> bool {
+    let Some(view) = current_view() else {
+        return false;
+    };
+
+    let WizardStepView::Capture { armed, .. } = view.step else {
+        return false;
+    };
+
+    if armed || !point_in_rect(x, y, capture_layout(client).advanced_toggle) {
+        return false;
+    }
+
+    with_wizard(|wizard| wizard.handle_command(WizardCommand::ToggleAdvancedCalibration));
+    true
 }
 
 fn handle_mouse_move(client_hwnd: Hwnd, lparam: Lparam) -> bool {
@@ -989,12 +1045,17 @@ fn create_controls(parent: Hwnd) {
         combo_visible: false,
         primary_visible: false,
         primary_enabled: false,
-        primary_text: String::new(),
     }));
 
     apply_control_style(device_combo);
     apply_control_style(primary_button);
     sync_controls();
+}
+
+fn select_primary_button_rect(client: Rect) -> Rect {
+    let width = 124;
+    let right = (client.right - 48).max(width + 48);
+    rect_xywh(right - width, 153, width, 30)
 }
 
 fn init_fonts() {
@@ -1080,32 +1141,29 @@ fn sync_controls() {
         } => {
             populate_device_combo(&mut controls, devices, *selected_index);
             set_visible(controls.device_combo, &mut controls.combo_visible, true);
-            set_visible(controls.primary_button, &mut controls.primary_visible, true);
+            set_visible(
+                controls.primary_button,
+                &mut controls.primary_visible,
+                false,
+            );
             set_enabled(
                 controls.primary_button,
                 &mut controls.primary_enabled,
-                !devices.is_empty(),
-            );
-            set_window_text(
-                controls.primary_button,
-                &mut controls.primary_text,
-                "Use device",
+                false,
             );
         }
-        WizardStepView::Capture { role, armed, .. } => {
+        WizardStepView::Capture { .. } => {
             set_visible(controls.device_combo, &mut controls.combo_visible, false);
-            set_visible(controls.primary_button, &mut controls.primary_visible, true);
+            set_visible(
+                controls.primary_button,
+                &mut controls.primary_visible,
+                false,
+            );
             set_enabled(
                 controls.primary_button,
                 &mut controls.primary_enabled,
-                !armed,
+                false,
             );
-            let text = if *armed {
-                format!("Waiting for {}", role.label())
-            } else {
-                format!("Capture {}", role.label())
-            };
-            set_window_text(controls.primary_button, &mut controls.primary_text, &text);
         }
         WizardStepView::Ready { .. } => {
             set_visible(controls.device_combo, &mut controls.combo_visible, false);
@@ -1182,15 +1240,6 @@ fn set_enabled(hwnd: Hwnd, current: &mut bool, enabled: bool) {
     if *current != enabled {
         unsafe { EnableWindow(hwnd, enabled as Bool) };
         *current = enabled;
-    }
-}
-
-fn set_window_text(hwnd: Hwnd, current: &mut String, text: &str) {
-    if current != text {
-        let value = wide(text);
-        unsafe { SetWindowTextW(hwnd, value.as_ptr()) };
-        current.clear();
-        current.push_str(text);
     }
 }
 
@@ -1478,6 +1527,17 @@ fn draw_hud_button_danger(hdc: Hdc, rect: Rect, label: &str) {
     );
 }
 
+fn draw_hud_button_disabled(hdc: Hdc, rect: Rect, label: &str) {
+    draw_hud_button_colored(
+        hdc,
+        rect,
+        label,
+        rgb(24, 27, 34),
+        rgb(48, 55, 68),
+        rgb(92, 101, 116),
+    );
+}
+
 fn draw_hud_button_colored(
     hdc: Hdc,
     rect: Rect,
@@ -1526,6 +1586,35 @@ fn start_button_rect(client: Rect) -> Rect {
         width,
         configure.bottom - configure.top,
     )
+}
+
+fn capture_layout(client: Rect) -> CaptureLayout {
+    let left = 24;
+    let right = (client.right - 24).max(left + 620);
+    let gap = 20;
+    let content_width = right - left;
+    let side_width = content_width.saturating_sub(gap + 500).clamp(170, 212);
+    let axes_width = (content_width - side_width - gap).max(360);
+    let side_left = left + axes_width + gap;
+    let button = rect_xywh(side_left, 126, side_width, 34);
+    let advanced_toggle = rect_xywh(left, 174, 220, 24);
+    let advanced_description = rect_xywh(
+        advanced_toggle.right + 18,
+        advanced_toggle.top + 1,
+        (side_left - advanced_toggle.right - 34).max(180),
+        22,
+    );
+    let axes_panel = rect_xywh(left, 208, axes_width, 224);
+    let binding_panel = rect_xywh(side_left, axes_panel.top, side_width, 156);
+
+    CaptureLayout {
+        left,
+        button,
+        advanced_toggle,
+        advanced_description,
+        axes_panel,
+        binding_panel,
+    }
 }
 
 fn chart_opacity_minus_rect(_client: Rect) -> Rect {
@@ -1643,15 +1732,24 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
             devices,
             selected_index,
         } => {
-            draw_device_picker(hdc, devices, *selected_index);
+            draw_device_picker(hdc, rect, devices, *selected_index);
         }
         WizardStepView::Capture {
             role,
             armed,
+            advanced_calibration,
             device,
             bindings,
         } => {
-            draw_capture_step(hdc, *role, *armed, device, bindings);
+            draw_capture_step(
+                hdc,
+                rect,
+                *role,
+                *armed,
+                *advanced_calibration,
+                device,
+                bindings,
+            );
         }
         WizardStepView::Ready {
             device,
@@ -1666,7 +1764,7 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
     draw_footer(hdc, rect, ready, overlay_running);
 }
 
-fn draw_device_picker(hdc: Hdc, devices: &[DeviceSnapshot], _selected_index: usize) {
+fn draw_device_picker(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], _selected_index: usize) {
     draw_text(
         hdc,
         24,
@@ -1675,6 +1773,11 @@ fn draw_device_picker(hdc: Hdc, devices: &[DeviceSnapshot], _selected_index: usi
         22,
         "Choose a controller from the dropdown, then click Use device.",
     );
+    if devices.is_empty() {
+        draw_hud_button_disabled(hdc, select_primary_button_rect(client), "Use device");
+    } else {
+        draw_hud_button(hdc, select_primary_button_rect(client), "Use device", true);
+    }
 
     if devices.is_empty() {
         draw_text(hdc, 24, 196, 720, 22, "No devices are currently available.");
@@ -1683,36 +1786,196 @@ fn draw_device_picker(hdc: Hdc, devices: &[DeviceSnapshot], _selected_index: usi
 
 fn draw_capture_step(
     hdc: Hdc,
+    client: Rect,
     role: InputRole,
     armed: bool,
+    advanced_calibration: bool,
     device: &Option<DeviceSnapshot>,
     bindings: &PedalBindings,
 ) {
+    let layout = capture_layout(client);
     let device_name = device
         .as_ref()
         .map(|device| device.name.as_str())
         .unwrap_or("No active device");
-    draw_text(hdc, 24, 124, 720, 22, &format!("Device: {}", device_name));
+    draw_text(
+        hdc,
+        layout.left,
+        124,
+        (layout.button.left - layout.left - 24).max(260),
+        22,
+        &format!("Device: {}", device_name),
+    );
 
     let instruction = if armed {
-        format!(
-            "Press {} fully, then release it. The highest point becomes 100%.",
-            role.label()
-        )
+        if advanced_calibration {
+            format!(
+                "Press {} fully, then release it. This custom range becomes 0-100%.",
+                role.label()
+            )
+        } else {
+            format!(
+                "Press {} once, then release it. The driver range is used for 0-100%.",
+                role.label()
+            )
+        }
     } else {
         format!("Release all pedals, then click Capture {}.", role.label())
     };
-    draw_text(hdc, 24, 150, 520, 22, &instruction);
+    draw_text(
+        hdc,
+        layout.left,
+        150,
+        (layout.button.left - layout.left - 24).max(260),
+        22,
+        &instruction,
+    );
+    if armed {
+        draw_hud_button_disabled(hdc, layout.button, &format!("Waiting {}", role.label()));
+    } else {
+        draw_hud_button(
+            hdc,
+            layout.button,
+            &format!("Capture {}", role.label()),
+            true,
+        );
+    }
+    draw_advanced_calibration_toggle(hdc, layout, advanced_calibration, armed);
 
     if let Some(device) = device {
-        draw_panel(hdc, 24, 184, 574, 262, color_panel_raised());
+        draw_panel(
+            hdc,
+            layout.axes_panel.left,
+            layout.axes_panel.top,
+            layout.axes_panel.right - layout.axes_panel.left,
+            layout.axes_panel.bottom - layout.axes_panel.top,
+            color_panel_raised(),
+        );
         for (i, axis) in device.axes.iter().enumerate() {
-            draw_axis(hdc, 38, 200 + (i as i32 * 38), 532, axis);
+            draw_axis(
+                hdc,
+                layout.axes_panel.left + 20,
+                layout.axes_panel.top + 14 + (i as i32 * 32),
+                (layout.axes_panel.right - layout.axes_panel.left - 40).max(120),
+                axis,
+            );
         }
     }
 
-    draw_panel(hdc, 612, 184, 142, 104, color_panel_raised());
-    draw_binding_summary(hdc, bindings, 626, 198);
+    draw_panel(
+        hdc,
+        layout.binding_panel.left,
+        layout.binding_panel.top,
+        layout.binding_panel.right - layout.binding_panel.left,
+        layout.binding_panel.bottom - layout.binding_panel.top,
+        color_panel_raised(),
+    );
+    draw_binding_summary(
+        hdc,
+        bindings,
+        layout.binding_panel.left + 20,
+        layout.binding_panel.top + 18,
+        layout.binding_panel.right - layout.binding_panel.left - 40,
+    );
+}
+
+fn draw_advanced_calibration_toggle(hdc: Hdc, layout: CaptureLayout, active: bool, disabled: bool) {
+    let row = layout.advanced_toggle;
+    let box_rect = rect_xywh(row.left, row.top + 3, 18, 18);
+    let border = if active {
+        color_accent()
+    } else {
+        rgb(74, 84, 102)
+    };
+    let fill = if active {
+        if disabled {
+            blend_colors(color_panel(), color_accent(), 0.45)
+        } else {
+            color_accent()
+        }
+    } else {
+        color_panel_raised()
+    };
+
+    fill_rect(hdc, box_rect, fill);
+    fill_rect(
+        hdc,
+        rect_xywh(
+            box_rect.left,
+            box_rect.top,
+            box_rect.right - box_rect.left,
+            1,
+        ),
+        border,
+    );
+    fill_rect(
+        hdc,
+        rect_xywh(
+            box_rect.left,
+            box_rect.bottom - 1,
+            box_rect.right - box_rect.left,
+            1,
+        ),
+        border,
+    );
+    fill_rect(
+        hdc,
+        rect_xywh(
+            box_rect.left,
+            box_rect.top,
+            1,
+            box_rect.bottom - box_rect.top,
+        ),
+        border,
+    );
+    fill_rect(
+        hdc,
+        rect_xywh(
+            box_rect.right - 1,
+            box_rect.top,
+            1,
+            box_rect.bottom - box_rect.top,
+        ),
+        border,
+    );
+    if active {
+        fill_rect(
+            hdc,
+            rect_xywh(box_rect.left + 5, box_rect.top + 5, 8, 8),
+            rgb(6, 18, 20),
+        );
+    }
+
+    draw_text_kind(
+        hdc,
+        row.left + 28,
+        row.top + 1,
+        row.right - row.left - 28,
+        22,
+        "Advanced calibration",
+        TextKind::Meta,
+        if disabled {
+            color_muted()
+        } else {
+            color_text()
+        },
+    );
+
+    let description = if active {
+        "Custom range: press full pedal travel to set 100% inside Apex."
+    } else {
+        "Recommended: use the range calibrated by the device driver."
+    };
+    draw_text_kind(
+        hdc,
+        layout.advanced_description.left,
+        layout.advanced_description.top,
+        layout.advanced_description.right - layout.advanced_description.left,
+        layout.advanced_description.bottom - layout.advanced_description.top,
+        description,
+        TextKind::Meta,
+        color_muted(),
+    );
 }
 
 fn draw_ready(
@@ -1772,12 +2035,12 @@ fn draw_ready(
     draw_combined_overlay_chart(hdc, layout.chart, history, settings.chart_opacity, true);
 }
 
-fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
+fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32, width: i32) {
     draw_text_kind(
         hdc,
         x,
         y,
-        150,
+        width,
         22,
         "Bindings",
         TextKind::Heading,
@@ -1787,10 +2050,18 @@ fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32) {
         hdc,
         x,
         y + 30,
+        width,
         InputRole::Throttle,
         bindings.throttle.as_ref(),
     );
-    draw_binding_line(hdc, x, y + 58, InputRole::Brake, bindings.brake.as_ref());
+    draw_binding_line(
+        hdc,
+        x,
+        y + 58,
+        width,
+        InputRole::Brake,
+        bindings.brake.as_ref(),
+    );
 }
 
 fn draw_overlay_controls(hdc: Hdc, client: Rect, settings: OverlaySettings, y: i32) {
@@ -2018,16 +2289,34 @@ fn draw_history_line(hdc: Hdc, plot: Rect, history: &[(f32, f32)], role: InputRo
     }
 }
 
-fn draw_binding_line(hdc: Hdc, x: i32, y: i32, role: InputRole, binding: Option<&BindingView>) {
-    let width = if x > 600 { 112 } else { 520 };
+fn draw_binding_line(
+    hdc: Hdc,
+    x: i32,
+    y: i32,
+    width: i32,
+    role: InputRole,
+    binding: Option<&BindingView>,
+) {
     let text = if let Some(binding) = binding {
-        format!(
-            "{}: {} idle={} active={}",
-            role.label(),
-            binding.axis_label,
-            binding.idle_raw,
-            binding.active_raw
-        )
+        if width < 170 {
+            format!("{}: {}", role.label(), binding.axis_label)
+        } else {
+            let range = match &binding.calibration {
+                BindingCalibration::DriverRange => "driver".to_string(),
+                BindingCalibration::CustomRange {
+                    idle_raw,
+                    active_raw,
+                } => format!("custom {}..{}", idle_raw, active_raw),
+            };
+            format!(
+                "{}: {} idle={} sample={} range={}",
+                role.label(),
+                binding.axis_label,
+                binding.idle_raw,
+                binding.active_raw,
+                range
+            )
+        }
     } else {
         format!("{}: not set", role.label())
     };
