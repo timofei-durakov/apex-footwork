@@ -20,6 +20,7 @@ type Hdc = isize;
 type Hfont = isize;
 type Hgdiobj = isize;
 type Hinstance = isize;
+type Hkey = isize;
 type Hwnd = isize;
 type Lparam = isize;
 type Lresult = isize;
@@ -102,6 +103,12 @@ const WS_EX_TOPMOST: Dword = 0x0000_0008;
 const WS_EX_TOOLWINDOW: Dword = 0x0000_0080;
 const WS_EX_LAYERED: Dword = 0x0008_0000;
 const LWA_ALPHA: Dword = 0x0000_0002;
+const ERROR_SUCCESS: i32 = 0;
+const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as Hkey;
+const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002u32 as Hkey;
+const KEY_READ: Dword = 0x0002_0019;
+const REG_SZ: Dword = 1;
+const REG_EXPAND_SZ: Dword = 2;
 
 #[repr(C)]
 struct JoyCapsW {
@@ -304,6 +311,26 @@ unsafe extern "system" {
     fn GetModuleHandleW(lpModuleName: *const u16) -> Hinstance;
 }
 
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegCloseKey(hKey: Hkey) -> i32;
+    fn RegOpenKeyExW(
+        hKey: Hkey,
+        lpSubKey: *const u16,
+        ulOptions: Dword,
+        samDesired: Dword,
+        phkResult: *mut Hkey,
+    ) -> i32;
+    fn RegQueryValueExW(
+        hKey: Hkey,
+        lpValueName: *const u16,
+        lpReserved: *mut Dword,
+        lpType: *mut Dword,
+        lpData: *mut u8,
+        lpcbData: *mut Dword,
+    ) -> i32;
+}
+
 struct WinmmDeviceProvider;
 
 impl DeviceProvider for WinmmDeviceProvider {
@@ -320,7 +347,7 @@ impl DeviceProvider for WinmmDeviceProvider {
 
             let mut device = DeviceSnapshot {
                 id,
-                name: name_from_wide(&caps.sz_pname),
+                name: joystick_display_name(id, &caps),
                 axes: axes_from_caps(&caps),
             };
 
@@ -1257,12 +1284,7 @@ fn populate_device_combo(
         }
 
         for device in devices {
-            let text = wide(&format!(
-                "[{}] {} ({} axes)",
-                device.id,
-                device.name,
-                device.axes.len()
-            ));
+            let text = wide(&device_display_label(device));
             unsafe {
                 SendMessageW(
                     controls.device_combo,
@@ -1395,6 +1417,99 @@ fn read_axis_values(device_id: u32) -> Option<[u32; 6]> {
         info.dw_upos,
         info.dw_vpos,
     ])
+}
+
+fn joystick_display_name(device_id: u32, caps: &JoyCapsW) -> String {
+    let fallback = name_from_wide(&caps.sz_pname);
+    let mut oem_keys = Vec::new();
+    push_unique_nonempty(&mut oem_keys, name_from_wide(&caps.sz_reg_key));
+
+    let settings_value = format!("Joystick{}OEMName", device_id + 1);
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        if let Some(oem_key) = registry_string(
+            root,
+            "System\\CurrentControlSet\\Control\\MediaResources\\Joystick\\DINPUT.DLL\\CurrentJoystickSettings",
+            &settings_value,
+        ) {
+            push_unique_nonempty(&mut oem_keys, oem_key);
+        }
+    }
+
+    for oem_key in oem_keys {
+        let oem_path = format!(
+            "System\\CurrentControlSet\\Control\\MediaProperties\\PrivateProperties\\Joystick\\OEM\\{}",
+            oem_key
+        );
+        for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+            if let Some(name) = registry_string(root, &oem_path, "OEMName") {
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
+    }
+
+    fallback
+}
+
+fn push_unique_nonempty(values: &mut Vec<String>, value: String) {
+    let value = value.trim().to_string();
+    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn registry_string(root: Hkey, subkey: &str, value_name: &str) -> Option<String> {
+    let subkey = wide(subkey);
+    let value_name = wide(value_name);
+    let mut key: Hkey = 0;
+    let opened = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_READ, &mut key) };
+    if opened != ERROR_SUCCESS {
+        return None;
+    }
+
+    let result = query_registry_string(key, value_name.as_ptr());
+    unsafe {
+        RegCloseKey(key);
+    }
+    result
+}
+
+fn query_registry_string(key: Hkey, value_name: *const u16) -> Option<String> {
+    let mut value_type: Dword = 0;
+    let mut byte_len: Dword = 0;
+    let size_result = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name,
+            null_mut(),
+            &mut value_type,
+            null_mut(),
+            &mut byte_len,
+        )
+    };
+    if size_result != ERROR_SUCCESS || !matches!(value_type, REG_SZ | REG_EXPAND_SZ) || byte_len < 2
+    {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; (byte_len as usize + 1) / 2];
+    let data_result = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name,
+            null_mut(),
+            &mut value_type,
+            buffer.as_mut_ptr() as *mut u8,
+            &mut byte_len,
+        )
+    };
+    if data_result != ERROR_SUCCESS || !matches!(value_type, REG_SZ | REG_EXPAND_SZ) {
+        return None;
+    }
+
+    Some(name_from_wide(&buffer))
 }
 
 fn draw(hwnd: Hwnd) {
@@ -1881,14 +1996,7 @@ fn draw_device_dropdown(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], sele
     let open = is_device_dropdown_open();
     let label = devices
         .get(selected_index)
-        .map(|device| {
-            format!(
-                "[{}] {} ({} axes)",
-                device.id,
-                device.name,
-                device.axes.len()
-            )
-        })
+        .map(device_display_label)
         .unwrap_or_else(|| "No devices available".to_string());
 
     draw_panel_with_border(
@@ -1946,12 +2054,7 @@ fn draw_device_dropdown(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], sele
             item.top + 7,
             item.right - item.left - 24,
             18,
-            &format!(
-                "[{}] {} ({} axes)",
-                device.id,
-                device.name,
-                device.axes.len()
-            ),
+            &device_display_label(device),
             TextKind::Meta,
             if selected {
                 color_accent()
@@ -1960,6 +2063,10 @@ fn draw_device_dropdown(hdc: Hdc, client: Rect, devices: &[DeviceSnapshot], sele
             },
         );
     }
+}
+
+fn device_display_label(device: &DeviceSnapshot) -> String {
+    format!("{} ({} axes)", device.name, device.axes.len())
 }
 
 fn draw_dropdown_arrow(hdc: Hdc, rect: Rect, open: bool) {

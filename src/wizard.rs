@@ -657,6 +657,11 @@ impl<P: DeviceProvider> Wizard<P> {
                     .iter()
                     .position(|device| device.name == profile.device_name)
             })
+            .or_else(|| {
+                self.devices
+                    .iter()
+                    .position(|device| device.id == profile.device_id)
+            })
     }
 
     fn binding_from_profile(
@@ -1013,6 +1018,24 @@ mod tests {
                 assert_eq!(device.unwrap().id, 99);
                 assert_near(value_for(&values, InputRole::Throttle), 0.5);
                 assert_near(value_for(&values, InputRole::Brake), 0.75);
+            }
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn restore_profile_can_fallback_to_id_when_display_name_changes() {
+        let provider = TestProvider::new(
+            vec![test_device(7, "Better OEM Name", &[0, 0])],
+            &[500, 250],
+        );
+        let mut wizard = Wizard::new(provider);
+
+        assert!(wizard.restore_profile(&profile_for(7, "Microsoft PC-joystick driver")));
+
+        match wizard.view().step {
+            WizardStepView::Ready { device, .. } => {
+                assert_eq!(device.unwrap().name, "Better OEM Name");
             }
             _ => panic!("expected ready state"),
         }
