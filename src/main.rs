@@ -19,6 +19,7 @@ type Hcursor = isize;
 type Hdc = isize;
 type Hfont = isize;
 type Hgdiobj = isize;
+type Hicon = isize;
 type Hinstance = isize;
 type Hkey = isize;
 type Hwnd = isize;
@@ -45,6 +46,7 @@ const JOY_RETURNALL: Dword = JOY_RETURNX
     | JOY_RETURNPOV
     | JOY_RETURNBUTTONS;
 
+const APP_ICON_RESOURCE_ID: usize = 1;
 const WM_CREATE: Uint = 0x0001;
 const WM_DESTROY: Uint = 0x0002;
 const WM_PAINT: Uint = 0x000F;
@@ -247,6 +249,7 @@ unsafe extern "system" {
     fn GetKeyState(nVirtKey: i32) -> i16;
     fn InvalidateRect(hWnd: Hwnd, lpRect: *const Rect, bErase: Bool) -> Bool;
     fn LoadCursorW(hInstance: Hinstance, lpCursorName: *const u16) -> Hcursor;
+    fn LoadIconW(hInstance: Hinstance, lpIconName: *const u16) -> Hicon;
     fn PostQuitMessage(nExitCode: i32);
     fn RegisterClassW(lpWndClass: *const WndClassW) -> u16;
     fn SendMessageW(hWnd: Hwnd, Msg: Uint, wParam: Wparam, lParam: Lparam) -> Lresult;
@@ -460,9 +463,10 @@ fn main() {
 unsafe fn run_window() {
     let class_name = wide("ApexFootworkWindow");
     let overlay_class_name = wide("ApexFootworkOverlayWindow");
-    let title = wide("Apex Footwork setup");
+    let title = wide("Apex Footwork");
     let h_instance = unsafe { GetModuleHandleW(null()) };
     let cursor = unsafe { LoadCursorW(0, 32512usize as *const u16) };
+    let icon = unsafe { LoadIconW(h_instance, APP_ICON_RESOURCE_ID as *const u16) };
 
     let wc = WndClassW {
         style: CS_HREDRAW | CS_VREDRAW,
@@ -470,7 +474,7 @@ unsafe fn run_window() {
         cb_cls_extra: 0,
         cb_wnd_extra: 0,
         h_instance,
-        h_icon: 0,
+        h_icon: icon,
         h_cursor: cursor,
         hbr_background: 0,
         lpsz_menu_name: null(),
@@ -484,7 +488,7 @@ unsafe fn run_window() {
         cb_cls_extra: 0,
         cb_wnd_extra: 0,
         h_instance,
-        h_icon: 0,
+        h_icon: icon,
         h_cursor: cursor,
         hbr_background: 0,
         lpsz_menu_name: null(),
