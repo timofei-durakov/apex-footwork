@@ -57,6 +57,10 @@ If `%APPDATA%` is unavailable, the app falls back to `%LOCALAPPDATA%`, then the 
 - Windows SDK resource compiler, `rc.exe`
 - NSIS with `makensis.exe` available in `PATH` for installer builds
 
+MSVC Windows builds link the Visual C++ runtime statically via `.cargo/config.toml`,
+so release builds do not require users to install the Microsoft Visual C++
+Redistributable separately.
+
 ## Build the app
 
 ```powershell
