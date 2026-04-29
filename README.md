@@ -101,4 +101,4 @@ scripts\build-installer.ps1    Release and installer build script
 
 ## Release notes
 
-Current builds are development builds and are not signed. Before public distribution, add code signing for both the application binary and the installer.
+Current builds are development builds and are not signed.
