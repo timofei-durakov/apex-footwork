@@ -2,6 +2,9 @@
 
 ![Apex Footwork screenshot](docs/apex_footwork.png)
 
+[Download](https://github.com/timofei-durakov/apex-footwork/releases/tag/v0.0.2) | [apexfootwork.com](https://apexfootwork.com) 
+
+
 Apex Footwork is a native Windows utility for mapping a pedal device to throttle and brake inputs, then monitoring those inputs in a lightweight on-screen overlay.
 
 The app walks through device selection, throttle detection, brake detection, and then shows live pedal values with a combined history graph.
