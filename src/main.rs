@@ -2472,6 +2472,7 @@ fn draw_combined_overlay_chart(
     let width = chart.right - chart.left;
     let height = chart.bottom - chart.top;
     let opacity = opacity.clamp(0.3, 1.0);
+    let show_legend = show_grip && width >= 420;
     draw_panel_with_border(
         hdc,
         x,
@@ -2482,14 +2483,14 @@ fn draw_combined_overlay_chart(
         blend_colors(color_app_bg(), color_border(), opacity),
     );
 
-    if width >= 420 {
+    if show_legend {
         draw_legend(hdc, x + 14, y + 12, opacity);
     }
     if show_grip {
         draw_resize_grip(hdc, chart, opacity);
     }
 
-    let top_padding = if width >= 420 { 42 } else { 18 };
+    let top_padding = if show_legend { 42 } else { 18 };
     let plot = rect_xywh(
         x + 14,
         y + top_padding,
