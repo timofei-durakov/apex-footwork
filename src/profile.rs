@@ -10,6 +10,8 @@ pub struct StoredProfile {
     pub device_name: String,
     pub throttle: StoredBinding,
     pub brake: StoredBinding,
+    pub steering: Option<StoredBinding>,
+    pub overlay_settings: StoredOverlaySettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +26,36 @@ pub struct StoredBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredCalibration {
     DriverRange,
-    CustomRange { idle_raw: u32, active_raw: u32 },
+    CustomRange {
+        idle_raw: u32,
+        active_raw: u32,
+    },
+    SteeringCustomRange {
+        center_raw: u32,
+        left_raw: u32,
+        right_raw: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredOverlaySettings {
+    pub steering_graph: bool,
+    pub steering_scale: StoredSteeringScale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredSteeringScale {
+    Linear,
+    Log,
+}
+
+impl Default for StoredOverlaySettings {
+    fn default() -> Self {
+        Self {
+            steering_graph: true,
+            steering_scale: StoredSteeringScale::Log,
+        }
+    }
 }
 
 pub fn load_profile() -> Option<StoredProfile> {
@@ -61,6 +92,20 @@ fn serialize_profile(profile: &StoredProfile) -> String {
     lines.push(format!("device_name={}", encode_text(&profile.device_name)));
     push_binding(&mut lines, "throttle", &profile.throttle);
     push_binding(&mut lines, "brake", &profile.brake);
+    if let Some(steering) = &profile.steering {
+        push_binding(&mut lines, "steering", steering);
+    }
+    lines.push(format!(
+        "overlay_steering_graph={}",
+        profile.overlay_settings.steering_graph
+    ));
+    lines.push(format!(
+        "overlay_steering_scale={}",
+        match profile.overlay_settings.steering_scale {
+            StoredSteeringScale::Linear => "linear",
+            StoredSteeringScale::Log => "log",
+        }
+    ));
     lines.join("\n")
 }
 
@@ -85,6 +130,16 @@ fn push_binding(lines: &mut Vec<String>, prefix: &str, binding: &StoredBinding) 
             lines.push(format!("{}_calibration_idle_raw={}", prefix, idle_raw));
             lines.push(format!("{}_calibration_active_raw={}", prefix, active_raw));
         }
+        StoredCalibration::SteeringCustomRange {
+            center_raw,
+            left_raw,
+            right_raw,
+        } => {
+            lines.push(format!("{}_calibration=steering_custom_range", prefix));
+            lines.push(format!("{}_calibration_center_raw={}", prefix, center_raw));
+            lines.push(format!("{}_calibration_left_raw={}", prefix, left_raw));
+            lines.push(format!("{}_calibration_right_raw={}", prefix, right_raw));
+        }
     }
 }
 
@@ -104,7 +159,23 @@ fn parse_profile(content: &str) -> Option<StoredProfile> {
         device_name: decode_text(values.get("device_name")?)?,
         throttle: parse_binding(&values, "throttle")?,
         brake: parse_binding(&values, "brake")?,
+        steering: parse_optional_binding(&values, "steering")?,
+        overlay_settings: parse_overlay_settings(&values)?,
     })
+}
+
+fn parse_optional_binding(
+    values: &HashMap<String, String>,
+    prefix: &str,
+) -> Option<Option<StoredBinding>> {
+    let has_binding = values
+        .keys()
+        .any(|key| key.starts_with(&format!("{}_", prefix)));
+    if has_binding {
+        Some(Some(parse_binding(values, prefix)?))
+    } else {
+        Some(None)
+    }
 }
 
 fn parse_binding(values: &HashMap<String, String>, prefix: &str) -> Option<StoredBinding> {
@@ -140,8 +211,54 @@ fn parse_calibration(values: &HashMap<String, String>, prefix: &str) -> Option<S
                 .parse()
                 .ok()?,
         }),
+        "steering_custom_range" => {
+            let center_raw = values
+                .get(&format!("{}_calibration_center_raw", prefix))?
+                .parse()
+                .ok()?;
+            let left_raw = values
+                .get(&format!("{}_calibration_left_raw", prefix))?
+                .parse()
+                .ok()?;
+            let right_raw = values
+                .get(&format!("{}_calibration_right_raw", prefix))?
+                .parse()
+                .ok()?;
+            valid_steering_range(center_raw, left_raw, right_raw).then_some(
+                StoredCalibration::SteeringCustomRange {
+                    center_raw,
+                    left_raw,
+                    right_raw,
+                },
+            )
+        }
         _ => None,
     }
+}
+
+fn parse_overlay_settings(values: &HashMap<String, String>) -> Option<StoredOverlaySettings> {
+    let steering_graph = match values.get("overlay_steering_graph").map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        Some(_) => return None,
+        None => StoredOverlaySettings::default().steering_graph,
+    };
+    let steering_scale = match values.get("overlay_steering_scale").map(String::as_str) {
+        Some("linear") => StoredSteeringScale::Linear,
+        Some("log") => StoredSteeringScale::Log,
+        Some(_) => return None,
+        None => StoredOverlaySettings::default().steering_scale,
+    };
+
+    Some(StoredOverlaySettings {
+        steering_graph,
+        steering_scale,
+    })
+}
+
+fn valid_steering_range(center_raw: u32, left_raw: u32, right_raw: u32) -> bool {
+    (left_raw < center_raw && center_raw < right_raw)
+        || (right_raw < center_raw && center_raw < left_raw)
 }
 
 fn encode_text(value: &str) -> String {
@@ -190,6 +307,21 @@ mod tests {
                     active_raw: 140,
                 },
             },
+            steering: Some(StoredBinding {
+                axis_index: 3,
+                axis_label: "R axis".to_string(),
+                idle_raw: 500,
+                active_raw: 900,
+                calibration: StoredCalibration::SteeringCustomRange {
+                    center_raw: 500,
+                    left_raw: 100,
+                    right_raw: 900,
+                },
+            }),
+            overlay_settings: StoredOverlaySettings {
+                steering_graph: false,
+                steering_scale: StoredSteeringScale::Linear,
+            },
         }
     }
 
@@ -237,6 +369,30 @@ mod tests {
 
         assert_eq!(profile.throttle.calibration, StoredCalibration::DriverRange);
         assert_eq!(profile.brake.calibration, StoredCalibration::DriverRange);
+    }
+
+    #[test]
+    fn parser_defaults_missing_steering_and_overlay_settings() {
+        let content = serialize_profile(&sample_profile())
+            .lines()
+            .filter(|line| !line.starts_with("steering_"))
+            .filter(|line| !line.starts_with("overlay_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let profile = parse_profile(&content).unwrap();
+
+        assert_eq!(profile.steering, None);
+        assert_eq!(profile.overlay_settings, StoredOverlaySettings::default());
+    }
+
+    #[test]
+    fn parser_rejects_invalid_advanced_steering_range() {
+        let content = serialize_profile(&sample_profile()).replace(
+            "steering_calibration_left_raw=100",
+            "steering_calibration_left_raw=600",
+        );
+
+        assert_eq!(parse_profile(&content), None);
     }
 
     #[test]

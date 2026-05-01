@@ -5,9 +5,9 @@
 [Download](https://github.com/timofei-durakov/apex-footwork/releases/tag/v0.0.2) | [apexfootwork.com](https://apexfootwork.com) 
 
 
-Apex Footwork is a native Windows utility for mapping a pedal device to throttle and brake inputs, then monitoring those inputs in a lightweight on-screen overlay.
+Apex Footwork is a native Windows utility for mapping a pedal/controller device to throttle, brake, and steering inputs, then monitoring those inputs in a lightweight on-screen overlay.
 
-The app walks through device selection, throttle detection, brake detection, and then shows live pedal values with a combined history graph.
+The app walks through device selection, throttle detection, brake detection, steering detection, and then shows live input values with pedal and steering history graphs.
 
 ## Important: unsigned application
 
@@ -18,23 +18,34 @@ Windows SmartScreen, antivirus software, or browser download protection may warn
 ## Features
 
 - Detects joystick/HID devices through the Windows multimedia joystick API.
-- Captures throttle and brake axes automatically from pedal movement.
-- Supports a recommended driver-range mode and an advanced custom 0-100% calibration mode.
+- Captures throttle, brake, and steering axes automatically from controller movement.
+- Supports a recommended driver-range mode and an advanced custom calibration mode.
 - Saves the selected device and bindings to a local profile.
 - Restores the saved profile on startup when the device is connected.
-- Provides a movable overlay with live throttle/brake bars and history graph.
+- Provides a movable overlay with live throttle/brake bars, a pedal history graph, and an optional vertical steering trace.
+- Includes overlay controls for steering graph visibility and sensitive steering display.
 - Embeds the project icon into the app binary, installer, uninstaller, and Start Menu shortcuts.
 
 ## Usage
 
 1. Connect the pedal/controller device.
 2. Launch Apex Footwork.
-3. Select the controller that owns the pedals.
+3. Select the controller that owns the pedals and steering input.
 4. Click `Use device`.
 5. Release all pedals, then click `Capture Throttle`.
 6. Press and release the throttle pedal.
 7. Repeat the capture flow for the brake pedal.
-8. Click `Start` to open the overlay.
+8. Center the steering input, then click `Capture Steering`.
+9. In normal mode, turn steering right once and release it. The full driver range is used for steering.
+10. Click `Start` to open the overlay.
+
+Advanced calibration can be enabled before each capture step. For pedals, advanced calibration saves the custom 0-100% travel captured during setup. For steering, advanced calibration captures center, full left, and full right.
+
+Overlay controls:
+
+- `Steering graph`: show or hide the vertical steering history graph.
+- `Sensitive steering`: use a log-style display scale that makes smaller steering movements easier to see. This changes only the graph display, not the saved binding or raw input mapping.
+- `Opacity`: adjust graph opacity.
 
 Useful shortcuts:
 
@@ -52,6 +63,8 @@ The profile is stored per user:
 ```
 
 If `%APPDATA%` is unavailable, the app falls back to `%LOCALAPPDATA%`, then the current working directory.
+
+The profile stores the selected device, throttle/brake/steering bindings, calibration data, and overlay display settings.
 
 ## Build requirements
 

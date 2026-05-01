@@ -9,7 +9,7 @@ use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
 use wizard::{
     AxisSnapshot, BindingCalibration, BindingView, DeviceProvider, DeviceSnapshot, InputRole,
-    PedalBindings, Wizard, WizardCommand, WizardStepView, WizardView,
+    LiveSample, PedalBindings, Wizard, WizardCommand, WizardStepView, WizardView,
 };
 
 type Bool = i32;
@@ -402,6 +402,14 @@ struct OverlaySettings {
     chart_width: i32,
     chart_height: i32,
     chart_opacity: f32,
+    show_steering_graph: bool,
+    steering_scale: SteeringGraphScale,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SteeringGraphScale {
+    Linear,
+    Log,
 }
 
 #[derive(Clone, Copy)]
@@ -420,7 +428,13 @@ struct OverlayLayout {
     column_width: i32,
     card_y: i32,
     controls_y: i32,
+    chart_area: Rect,
     chart: Rect,
+    steering_chart: Option<Rect>,
+    opacity_minus: Rect,
+    opacity_plus: Rect,
+    steering_toggle: Rect,
+    sensitivity_toggle: Rect,
 }
 
 #[derive(Clone, Copy)]
@@ -439,6 +453,8 @@ impl Default for OverlaySettings {
             chart_width: 0,
             chart_height: 168,
             chart_opacity: 0.9,
+            show_steering_graph: true,
+            steering_scale: SteeringGraphScale::Log,
         }
     }
 }
@@ -451,6 +467,7 @@ fn main() {
 
     let mut wizard = Wizard::new(WinmmDeviceProvider);
     if let Some(saved_profile) = profile::load_profile() {
+        apply_saved_overlay_settings(&saved_profile.overlay_settings);
         if wizard.restore_profile(&saved_profile) {
             remember_saved_profile(&saved_profile);
         }
@@ -730,7 +747,11 @@ fn close_overlay_window() {
 fn overlay_window_size() -> (i32, i32) {
     let settings = overlay_settings();
     let width = if settings.chart_width <= 0 {
-        520
+        if settings.show_steering_graph {
+            640
+        } else {
+            520
+        }
     } else {
         settings.chart_width
     }
@@ -949,7 +970,7 @@ fn start_resize_drag(hwnd: Hwnd, client: Rect, x: i32, y: i32) -> bool {
 
     let settings = overlay_settings();
     let layout = overlay_layout(client, settings);
-    if !point_in_rect(x, y, chart_resize_handle_rect(layout.chart)) {
+    if !point_in_rect(x, y, chart_resize_handle_rect(layout.chart_area)) {
         return false;
     }
 
@@ -957,8 +978,8 @@ fn start_resize_drag(hwnd: Hwnd, client: Rect, x: i32, y: i32) -> bool {
         *drag = Some(ResizeDrag {
             start_x: x,
             start_y: y,
-            start_width: layout.chart.right - layout.chart.left,
-            start_height: layout.chart.bottom - layout.chart.top,
+            start_width: layout.chart_area.right - layout.chart_area.left,
+            start_height: layout.chart_area.bottom - layout.chart_area.top,
         });
     }
     unsafe { SetCapture(hwnd) };
@@ -977,10 +998,12 @@ fn resize_chart_to_mouse(client: Rect, x: i32, y: i32) {
     };
 
     let footer_top = client.bottom - 48;
+    let layout = overlay_layout(client, overlay_settings());
     let max_width = (client.right - 64).max(260);
-    let max_height = (footer_top - 308 - 20).max(96).min(360);
+    let max_height = (footer_top - layout.chart_area.top - 20).max(48).min(360);
     let new_width = (drag.start_width + (x - drag.start_x)).clamp(260, max_width);
-    let new_height = (drag.start_height + (y - drag.start_y)).clamp(96, max_height);
+    let min_height = 64.min(max_height);
+    let new_height = (drag.start_height + (y - drag.start_y)).clamp(min_height, max_height);
 
     if let Some(settings_lock) = OVERLAY_SETTINGS.get() {
         if let Ok(mut settings) = settings_lock.lock() {
@@ -1016,13 +1039,34 @@ fn handle_overlay_settings_click(client: Rect, x: i32, y: i32) -> bool {
     let Ok(mut settings) = lock.lock() else {
         return false;
     };
+    let layout = overlay_layout(client, *settings);
 
-    if point_in_rect(x, y, chart_opacity_minus_rect(client)) {
+    if point_in_rect(x, y, layout.opacity_minus) {
         settings.chart_opacity = (settings.chart_opacity - 0.1).max(0.3);
+        drop(settings);
+        save_current_profile();
         return true;
     }
-    if point_in_rect(x, y, chart_opacity_plus_rect(client)) {
+    if point_in_rect(x, y, layout.opacity_plus) {
         settings.chart_opacity = (settings.chart_opacity + 0.1).min(1.0);
+        drop(settings);
+        save_current_profile();
+        return true;
+    }
+    if point_in_rect(x, y, layout.steering_toggle) {
+        settings.show_steering_graph = !settings.show_steering_graph;
+        drop(settings);
+        save_current_profile();
+        return true;
+    }
+    if point_in_rect(x, y, layout.sensitivity_toggle) {
+        settings.steering_scale = if settings.steering_scale == SteeringGraphScale::Log {
+            SteeringGraphScale::Linear
+        } else {
+            SteeringGraphScale::Log
+        };
+        drop(settings);
+        save_current_profile();
         return true;
     }
 
@@ -1055,9 +1099,10 @@ fn remember_saved_profile(profile: &profile::StoredProfile) {
 }
 
 fn maybe_save_profile(wizard: &Wizard<WinmmDeviceProvider>) {
-    let Some(profile) = wizard.profile() else {
+    let Some(mut profile) = wizard.profile() else {
         return;
     };
+    profile.overlay_settings = stored_overlay_settings();
 
     let signature = profile::profile_signature(&profile);
     let Ok(mut saved_signature) = SAVED_PROFILE_SIGNATURE
@@ -1073,6 +1118,40 @@ fn maybe_save_profile(wizard: &Wizard<WinmmDeviceProvider>) {
 
     if profile::save_profile(&profile).is_ok() {
         *saved_signature = Some(signature);
+    }
+}
+
+fn save_current_profile() {
+    let Some(lock) = STATE.get() else {
+        return;
+    };
+    let Ok(wizard) = lock.lock() else {
+        return;
+    };
+    maybe_save_profile(&wizard);
+}
+
+fn apply_saved_overlay_settings(stored: &profile::StoredOverlaySettings) {
+    if let Ok(mut settings) = OVERLAY_SETTINGS
+        .get_or_init(|| Mutex::new(OverlaySettings::default()))
+        .lock()
+    {
+        settings.show_steering_graph = stored.steering_graph;
+        settings.steering_scale = match stored.steering_scale {
+            profile::StoredSteeringScale::Linear => SteeringGraphScale::Linear,
+            profile::StoredSteeringScale::Log => SteeringGraphScale::Log,
+        };
+    }
+}
+
+fn stored_overlay_settings() -> profile::StoredOverlaySettings {
+    let settings = overlay_settings();
+    profile::StoredOverlaySettings {
+        steering_graph: settings.show_steering_graph,
+        steering_scale: match settings.steering_scale {
+            SteeringGraphScale::Linear => profile::StoredSteeringScale::Linear,
+            SteeringGraphScale::Log => profile::StoredSteeringScale::Log,
+        },
     }
 }
 
@@ -1633,7 +1712,12 @@ fn draw_overlay_scene(hdc: Hdc, rect: Rect) {
     };
 
     if let WizardStepView::Ready { history, .. } = &view.step {
-        draw_combined_overlay_chart(hdc, rect, history, 1.0, false);
+        let settings = overlay_settings();
+        let (pedal_chart, steering_chart) = split_history_charts(rect, settings);
+        draw_combined_overlay_chart(hdc, pedal_chart, history, 1.0, false);
+        if let Some(steering_chart) = steering_chart {
+            draw_steering_trace(hdc, steering_chart, history, settings.steering_scale, 1.0);
+        }
     } else {
         draw_text_kind(
             hdc,
@@ -1781,6 +1865,49 @@ fn draw_hud_button_colored(
     draw_centered_text_kind(hdc, rect, label, TextKind::Body, text);
 }
 
+fn draw_checkbox(hdc: Hdc, rect: Rect, label: &str, checked: bool) {
+    draw_panel_with_border(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        color_panel_raised(),
+        if checked {
+            color_accent()
+        } else {
+            rgb(74, 84, 102)
+        },
+    );
+    let box_rect = rect_xywh(rect.left + 8, rect.top + 6, 16, 16);
+    fill_rect(
+        hdc,
+        box_rect,
+        if checked {
+            color_accent()
+        } else {
+            color_panel()
+        },
+    );
+    if checked {
+        fill_rect(
+            hdc,
+            rect_xywh(box_rect.left + 4, box_rect.top + 4, 8, 8),
+            rgb(6, 18, 20),
+        );
+    }
+    draw_text_kind(
+        hdc,
+        rect.left + 32,
+        rect.top + 5,
+        rect.right - rect.left - 38,
+        18,
+        label,
+        TextKind::Meta,
+        color_text(),
+    );
+}
+
 fn configure_button_rect(client: Rect) -> Rect {
     let width = 104;
     let right = (client.right - 32).max(width + 32);
@@ -1825,14 +1952,6 @@ fn capture_layout(client: Rect) -> CaptureLayout {
         axes_panel,
         binding_panel,
     }
-}
-
-fn chart_opacity_minus_rect(_client: Rect) -> Rect {
-    rect_xywh(390, 268, 34, 28)
-}
-
-fn chart_opacity_plus_rect(_client: Rect) -> Rect {
-    rect_xywh(430, 268, 34, 28)
 }
 
 fn chart_resize_handle_rect(chart: Rect) -> Rect {
@@ -2141,7 +2260,14 @@ fn draw_capture_step(
         &format!("Device: {}", device_name),
     );
 
-    let instruction = if armed {
+    let instruction = if role == InputRole::Steering && armed && advanced_calibration {
+        "Follow the status prompt: capture full left, release to center, then full right."
+            .to_string()
+    } else if role == InputRole::Steering && armed {
+        "Turn steering right once, then release it. The driver range is used.".to_string()
+    } else if role == InputRole::Steering {
+        "Center steering, then click Capture Steering.".to_string()
+    } else if armed {
         if advanced_calibration {
             format!(
                 "Press {} fully, then release it. This custom range becomes 0-100%.",
@@ -2174,7 +2300,7 @@ fn draw_capture_step(
             true,
         );
     }
-    draw_advanced_calibration_toggle(hdc, layout, advanced_calibration, armed);
+    draw_advanced_calibration_toggle(hdc, layout, role, advanced_calibration, armed);
 
     if let Some(device) = device {
         draw_panel(
@@ -2213,7 +2339,13 @@ fn draw_capture_step(
     );
 }
 
-fn draw_advanced_calibration_toggle(hdc: Hdc, layout: CaptureLayout, active: bool, disabled: bool) {
+fn draw_advanced_calibration_toggle(
+    hdc: Hdc,
+    layout: CaptureLayout,
+    role: InputRole,
+    active: bool,
+    disabled: bool,
+) {
     let row = layout.advanced_toggle;
     let box_rect = rect_xywh(row.left, row.top + 3, 18, 18);
     let border = if active {
@@ -2295,7 +2427,11 @@ fn draw_advanced_calibration_toggle(hdc: Hdc, layout: CaptureLayout, active: boo
         },
     );
 
-    let description = if active {
+    let description = if role == InputRole::Steering && active {
+        "Custom range: capture center, full left, and full right."
+    } else if role == InputRole::Steering {
+        "Recommended: use the full steering range calibrated by the driver."
+    } else if active {
         "Custom range: press full pedal travel to set 100% inside Apex."
     } else {
         "Recommended: use the range calibrated by the device driver."
@@ -2318,7 +2454,7 @@ fn draw_ready(
     device: &Option<DeviceSnapshot>,
     _bindings: &PedalBindings,
     values: &[(InputRole, f32)],
-    history: &[(f32, f32)],
+    history: &[LiveSample],
 ) {
     let device_name = device
         .as_ref()
@@ -2346,7 +2482,6 @@ fn draw_ready(
         .iter()
         .find_map(|(role, value)| (*role == InputRole::Brake).then_some(*value))
         .unwrap_or(0.0);
-
     draw_value_bar(
         hdc,
         layout.content_left,
@@ -2365,8 +2500,18 @@ fn draw_ready(
         brake,
         rgb(255, 82, 96),
     );
-    draw_overlay_controls(hdc, rect, settings, layout.controls_y);
-    draw_combined_overlay_chart(hdc, layout.chart, history, settings.chart_opacity, true);
+    draw_overlay_controls(hdc, layout, settings);
+    draw_combined_overlay_chart(hdc, layout.chart, history, settings.chart_opacity, false);
+    if let Some(steering_chart) = layout.steering_chart {
+        draw_steering_trace(
+            hdc,
+            steering_chart,
+            history,
+            settings.steering_scale,
+            settings.chart_opacity,
+        );
+    }
+    draw_resize_grip(hdc, layout.chart_area, settings.chart_opacity);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32, width: i32) {
@@ -2396,14 +2541,25 @@ fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32, widt
         InputRole::Brake,
         bindings.brake.as_ref(),
     );
+    draw_binding_line(
+        hdc,
+        x,
+        y + 86,
+        width,
+        InputRole::Steering,
+        bindings.steering.as_ref(),
+    );
 }
 
-fn draw_overlay_controls(hdc: Hdc, client: Rect, settings: OverlaySettings, y: i32) {
+fn draw_overlay_controls(hdc: Hdc, layout: OverlayLayout, settings: OverlaySettings) {
+    let y = layout.controls_y;
+    let opacity_label_left = layout.opacity_minus.left - 104;
+    let resize_width = (opacity_label_left - layout.content_left - 12).clamp(80, 220);
     draw_text_kind(
         hdc,
-        32,
+        layout.content_left,
         y + 5,
-        220,
+        resize_width,
         20,
         "Resize graph by dragging its corner",
         TextKind::Meta,
@@ -2412,7 +2568,7 @@ fn draw_overlay_controls(hdc: Hdc, client: Rect, settings: OverlaySettings, y: i
 
     draw_text_kind(
         hdc,
-        284,
+        opacity_label_left,
         y + 5,
         92,
         20,
@@ -2420,24 +2576,59 @@ fn draw_overlay_controls(hdc: Hdc, client: Rect, settings: OverlaySettings, y: i
         TextKind::Meta,
         color_muted(),
     );
-    draw_hud_button(hdc, chart_opacity_minus_rect(client), "-", false);
-    draw_hud_button(hdc, chart_opacity_plus_rect(client), "+", false);
+    draw_hud_button(hdc, layout.opacity_minus, "-", false);
+    draw_hud_button(hdc, layout.opacity_plus, "+", false);
+
+    draw_checkbox(
+        hdc,
+        layout.steering_toggle,
+        "Steering graph",
+        settings.show_steering_graph,
+    );
+    draw_checkbox(
+        hdc,
+        layout.sensitivity_toggle,
+        "Sensitive steering",
+        settings.steering_scale == SteeringGraphScale::Log,
+    );
 }
 
 fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
     let content_left = 32;
     let content_right = (client.right - 32).max(content_left + 1);
     let content_width = content_right - content_left;
-    let gap = 24;
-    let column_width = ((content_width - gap) / 2).max(220);
+    let gap = if content_width < 520 { 16 } else { 24 };
+    let column_width = ((content_width - gap) / 2).max(120);
     let right_x = content_left + column_width + gap;
-    let card_y = 166;
-    let controls_y = 268;
-    let chart_y = 316;
+    let source_y = 132;
+    let card_y = source_y + 34;
+    let controls_y = card_y + 112;
+    let chart_y = controls_y + 68;
     let footer_top = client.bottom - 48;
-    let available_chart_height = (footer_top - chart_y - 20).max(96);
-    let chart_width = visible_chart_width(client, settings);
-    let chart_height = settings.chart_height.min(available_chart_height).max(96);
+    let available_chart_height = (footer_top - chart_y - 20).max(48);
+    let chart_area_width = visible_chart_width(client, settings);
+    let chart_height = settings
+        .chart_height
+        .min(available_chart_height)
+        .max(64)
+        .min(available_chart_height);
+    let chart_area = rect_xywh(content_left, chart_y, chart_area_width, chart_height);
+    let (chart, steering_chart) = split_history_charts(chart_area, settings);
+    let opacity_plus_left = (content_left + 420)
+        .min(content_right - 34)
+        .max(content_left + 74);
+    let opacity_plus = rect_xywh(opacity_plus_left, controls_y, 34, 28);
+    let opacity_minus = rect_xywh(opacity_plus.left - 40, controls_y, 34, 28);
+    let row2_y = controls_y + 34;
+    let steering_toggle_width = (content_width / 2 - 8).clamp(112, 168);
+    let steering_toggle = rect_xywh(content_left, row2_y, steering_toggle_width, 28);
+    let sensitivity_toggle_width = (content_width - steering_toggle_width - 12).clamp(132, 190);
+    let sensitivity_toggle = rect_xywh(
+        steering_toggle.right + 12,
+        row2_y,
+        sensitivity_toggle_width,
+        28,
+    );
 
     OverlayLayout {
         content_left,
@@ -2446,8 +2637,47 @@ fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
         column_width,
         card_y,
         controls_y,
-        chart: rect_xywh(content_left, chart_y, chart_width, chart_height),
+        chart_area,
+        chart,
+        steering_chart,
+        opacity_minus,
+        opacity_plus,
+        steering_toggle,
+        sensitivity_toggle,
     }
+}
+
+fn split_history_charts(chart_area: Rect, settings: OverlaySettings) -> (Rect, Option<Rect>) {
+    let width = chart_area.right - chart_area.left;
+    let gap = 0;
+    const MIN_PEDAL_CHART_WIDTH: i32 = 260;
+    const MIN_STEERING_CHART_WIDTH: i32 = 88;
+    let show_steering =
+        settings.show_steering_graph && width >= MIN_PEDAL_CHART_WIDTH + MIN_STEERING_CHART_WIDTH;
+    if !show_steering {
+        return (chart_area, None);
+    }
+
+    let steering_width = (width / 5).clamp(MIN_STEERING_CHART_WIDTH, 132);
+    let pedal_width = width - steering_width - gap;
+    if pedal_width < MIN_PEDAL_CHART_WIDTH {
+        return (chart_area, None);
+    }
+
+    (
+        rect_xywh(
+            chart_area.left,
+            chart_area.top,
+            pedal_width,
+            chart_area.bottom - chart_area.top,
+        ),
+        Some(rect_xywh(
+            chart_area.left + pedal_width + gap,
+            chart_area.top,
+            steering_width,
+            chart_area.bottom - chart_area.top,
+        )),
+    )
 }
 
 fn visible_chart_width(client: Rect, settings: OverlaySettings) -> i32 {
@@ -2463,7 +2693,7 @@ fn visible_chart_width(client: Rect, settings: OverlaySettings) -> i32 {
 fn draw_combined_overlay_chart(
     hdc: Hdc,
     chart: Rect,
-    history: &[(f32, f32)],
+    history: &[LiveSample],
     opacity: f32,
     show_grip: bool,
 ) {
@@ -2586,7 +2816,90 @@ fn draw_legend_item(hdc: Hdc, x: i32, y: i32, label: &str, color: Dword) {
     draw_text_kind(hdc, x + 32, y, 72, 20, label, TextKind::Meta, color_muted());
 }
 
-fn draw_history_line(hdc: Hdc, plot: Rect, history: &[(f32, f32)], role: InputRole, color: Dword) {
+fn draw_steering_trace(
+    hdc: Hdc,
+    chart: Rect,
+    history: &[LiveSample],
+    scale: SteeringGraphScale,
+    opacity: f32,
+) {
+    let opacity = opacity.clamp(0.3, 1.0);
+    let width = chart.right - chart.left;
+    let height = chart.bottom - chart.top;
+    draw_panel_with_border(
+        hdc,
+        chart.left,
+        chart.top,
+        width,
+        height,
+        blend_colors(color_app_bg(), color_panel_raised(), opacity),
+        blend_colors(color_app_bg(), color_border(), opacity),
+    );
+
+    let plot = rect_xywh(chart.left + 12, chart.top + 12, width - 24, height - 24);
+    let center_x = plot.left + (plot.right - plot.left) / 2;
+    fill_rect(
+        hdc,
+        rect_xywh(center_x, plot.top, 1, plot.bottom - plot.top),
+        blend_colors(color_app_bg(), rgb(74, 84, 102), opacity),
+    );
+
+    if history.len() < 2 || plot.right <= plot.left || plot.bottom <= plot.top {
+        return;
+    }
+
+    let max_samples = (plot.bottom - plot.top).max(2) as usize;
+    let start = history.len().saturating_sub(max_samples);
+    let visible = &history[start..];
+    let pen = unsafe {
+        CreatePen(
+            PS_SOLID,
+            2,
+            blend_colors(color_app_bg(), rgb(255, 198, 92), opacity),
+        )
+    };
+    let old_pen = unsafe { SelectObject(hdc, pen) };
+    let half_width = ((plot.right - plot.left - 1).max(1) as f32) / 2.0;
+    let span_y = (plot.bottom - plot.top - 1).max(1) as f32;
+
+    for (index, sample) in visible.iter().enumerate() {
+        let scaled = scaled_steering_value(sample.steering, scale);
+        let x = center_x + (scaled * half_width).round() as i32;
+        let reverse_index = visible.len() - 1 - index;
+        let y = plot.bottom
+            - 1
+            - ((reverse_index as f32 / (visible.len() - 1) as f32) * span_y).round() as i32;
+
+        unsafe {
+            if index == 0 {
+                MoveToEx(hdc, x, y, null_mut());
+            } else {
+                LineTo(hdc, x, y);
+            }
+        }
+    }
+
+    unsafe {
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen);
+    }
+}
+
+fn scaled_steering_value(value: f32, scale: SteeringGraphScale) -> f32 {
+    let value = value.clamp(-1.0, 1.0);
+    match scale {
+        SteeringGraphScale::Linear => value,
+        SteeringGraphScale::Log => {
+            if value == 0.0 {
+                0.0
+            } else {
+                value.signum() * (1.0 + 9.0 * value.abs()).ln() / 10.0_f32.ln()
+            }
+        }
+    }
+}
+
+fn draw_history_line(hdc: Hdc, plot: Rect, history: &[LiveSample], role: InputRole, color: Dword) {
     let plot_width = (plot.right - plot.left).max(1) as usize;
     let start = history.len().saturating_sub(plot_width);
     let visible = &history[start..];
@@ -2601,8 +2914,9 @@ fn draw_history_line(hdc: Hdc, plot: Rect, history: &[(f32, f32)], role: InputRo
 
     for (index, sample) in visible.iter().enumerate() {
         let value = match role {
-            InputRole::Throttle => sample.0,
-            InputRole::Brake => sample.1,
+            InputRole::Throttle => sample.throttle,
+            InputRole::Brake => sample.brake,
+            InputRole::Steering => 0.0,
         }
         .clamp(0.0, 1.0);
 
@@ -2642,6 +2956,11 @@ fn draw_binding_line(
                     idle_raw,
                     active_raw,
                 } => format!("custom {}..{}", idle_raw, active_raw),
+                BindingCalibration::SteeringCustomRange {
+                    center_raw,
+                    left_raw,
+                    right_raw,
+                } => format!("custom L{} C{} R{}", left_raw, center_raw, right_raw),
             };
             format!(
                 "{}: {} idle={} sample={} range={}",
@@ -2841,4 +3160,124 @@ fn wide(value: &str) -> Vec<u16> {
 
 fn rgb(r: u8, g: u8, b: u8) -> Dword {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(width: i32, height: i32) -> Rect {
+        rect_xywh(0, 0, width, height)
+    }
+
+    fn width(rect: Rect) -> i32 {
+        rect.right - rect.left
+    }
+
+    fn intersects(a: Rect, b: Rect) -> bool {
+        a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+    }
+
+    fn assert_inside(inner: Rect, outer: Rect) {
+        assert!(inner.left >= outer.left);
+        assert!(inner.right <= outer.right);
+        assert!(inner.top >= outer.top);
+        assert!(inner.bottom <= outer.bottom);
+    }
+
+    #[test]
+    fn ready_overlay_layout_does_not_overlap_charts() {
+        for rect in [
+            client(780, 520),
+            client(640, 480),
+            client(360, 480),
+            client(1024, 720),
+        ] {
+            let layout = overlay_layout(rect, OverlaySettings::default());
+            let left_card = rect_xywh(layout.content_left, layout.card_y, layout.column_width, 94);
+            let right_card = rect_xywh(layout.right_x, layout.card_y, layout.column_width, 94);
+            let content = rect_xywh(layout.content_left, 0, layout.content_width, rect.bottom);
+            assert_inside(left_card, content);
+            assert_inside(right_card, content);
+            assert!(!intersects(left_card, right_card));
+            assert_inside(layout.chart, layout.chart_area);
+            assert!(layout.chart_area.bottom <= rect.bottom - 48);
+            if let Some(steering) = layout.steering_chart {
+                assert_inside(steering, layout.chart_area);
+                assert!(!intersects(layout.chart, steering));
+                assert_eq!(layout.chart.right, steering.left);
+            }
+        }
+    }
+
+    #[test]
+    fn steering_graph_toggle_gives_pedals_more_width_when_off() {
+        let rect = client(780, 520);
+        let on = overlay_layout(rect, OverlaySettings::default());
+        let off = overlay_layout(
+            rect,
+            OverlaySettings {
+                show_steering_graph: false,
+                ..OverlaySettings::default()
+            },
+        );
+
+        assert!(on.steering_chart.is_some());
+        assert!(off.steering_chart.is_none());
+        assert!(width(off.chart) > width(on.chart));
+    }
+
+    #[test]
+    fn steering_graph_stays_visible_until_true_minimum_width() {
+        let settings = OverlaySettings::default();
+        let minimum_with_steering = rect_xywh(0, 0, 348, 120);
+        let below_minimum = rect_xywh(0, 0, 347, 120);
+
+        assert!(
+            split_history_charts(minimum_with_steering, settings)
+                .1
+                .is_some()
+        );
+        assert!(split_history_charts(below_minimum, settings).1.is_none());
+    }
+
+    #[test]
+    fn overlay_controls_stay_inside_content() {
+        for rect in [
+            client(780, 520),
+            client(640, 480),
+            client(360, 480),
+            client(1024, 720),
+        ] {
+            let layout = overlay_layout(rect, OverlaySettings::default());
+            let content = rect_xywh(
+                layout.content_left,
+                layout.controls_y,
+                layout.content_width,
+                62,
+            );
+
+            for control in [
+                layout.opacity_minus,
+                layout.opacity_plus,
+                layout.steering_toggle,
+                layout.sensitivity_toggle,
+            ] {
+                assert_inside(control, content);
+            }
+            assert!(!intersects(layout.opacity_minus, layout.opacity_plus));
+            assert!(!intersects(
+                layout.steering_toggle,
+                layout.sensitivity_toggle
+            ));
+        }
+    }
+
+    #[test]
+    fn log_steering_scale_preserves_direction_and_expands_center() {
+        assert_eq!(scaled_steering_value(0.0, SteeringGraphScale::Log), 0.0);
+        assert!(scaled_steering_value(0.2, SteeringGraphScale::Log) > 0.2);
+        assert!(scaled_steering_value(-0.2, SteeringGraphScale::Log) < -0.2);
+        assert_eq!(scaled_steering_value(1.0, SteeringGraphScale::Log), 1.0);
+    }
 }

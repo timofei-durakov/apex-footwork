@@ -44,6 +44,7 @@ pub trait DeviceProvider {
 pub enum InputRole {
     Throttle,
     Brake,
+    Steering,
 }
 
 impl InputRole {
@@ -51,6 +52,7 @@ impl InputRole {
         match self {
             InputRole::Throttle => "Throttle",
             InputRole::Brake => "Brake",
+            InputRole::Steering => "Steering",
         }
     }
 }
@@ -68,21 +70,33 @@ pub struct BindingView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BindingCalibration {
     DriverRange,
-    CustomRange { idle_raw: u32, active_raw: u32 },
+    CustomRange {
+        idle_raw: u32,
+        active_raw: u32,
+    },
+    SteeringCustomRange {
+        center_raw: u32,
+        left_raw: u32,
+        right_raw: u32,
+    },
 }
 
 impl BindingView {
-    fn value(&self, axes: &[AxisSnapshot]) -> f32 {
+    pub fn value(&self, axes: &[AxisSnapshot]) -> f32 {
         let Some(axis) = axes.get(self.axis_index) else {
             return 0.0;
         };
 
-        match self.calibration {
-            BindingCalibration::DriverRange => self.driver_range_value(axis),
-            BindingCalibration::CustomRange {
-                idle_raw,
-                active_raw,
-            } => Self::raw_span_value(axis.raw, idle_raw, active_raw),
+        match self.role {
+            InputRole::Steering => self.steering_value(axis),
+            InputRole::Throttle | InputRole::Brake => match self.calibration {
+                BindingCalibration::DriverRange => self.driver_range_value(axis),
+                BindingCalibration::CustomRange {
+                    idle_raw,
+                    active_raw,
+                } => Self::raw_span_value(axis.raw, idle_raw, active_raw),
+                BindingCalibration::SteeringCustomRange { .. } => 0.0,
+            },
         }
     }
 
@@ -109,19 +123,76 @@ impl BindingView {
 
         ((raw as f32 - idle) / span).clamp(0.0, 1.0)
     }
+
+    fn steering_value(&self, axis: &AxisSnapshot) -> f32 {
+        match self.calibration {
+            BindingCalibration::DriverRange => self.driver_range_steering_value(axis),
+            BindingCalibration::SteeringCustomRange {
+                center_raw,
+                left_raw,
+                right_raw,
+            } => Self::custom_steering_value(axis.raw, center_raw, left_raw, right_raw),
+            BindingCalibration::CustomRange { .. } => 0.0,
+        }
+    }
+
+    fn driver_range_steering_value(&self, axis: &AxisSnapshot) -> f32 {
+        if axis.max <= axis.min || self.idle_raw == self.active_raw {
+            return 0.0;
+        }
+
+        let normalized = Self::raw_span_value(axis.raw, axis.min, axis.max);
+        let value = normalized * 2.0 - 1.0;
+        if self.active_raw > self.idle_raw {
+            value
+        } else {
+            -value
+        }
+        .clamp(-1.0, 1.0)
+    }
+
+    fn custom_steering_value(raw: u32, center_raw: u32, left_raw: u32, right_raw: u32) -> f32 {
+        let right_value = Self::raw_span_value(raw, center_raw, right_raw);
+        let left_value = Self::raw_span_value(raw, center_raw, left_raw);
+
+        if right_raw > center_raw && left_raw < center_raw {
+            if raw >= center_raw {
+                right_value
+            } else {
+                -left_value
+            }
+        } else if right_raw < center_raw && left_raw > center_raw {
+            if raw <= center_raw {
+                right_value
+            } else {
+                -left_value
+            }
+        } else {
+            0.0
+        }
+        .clamp(-1.0, 1.0)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct PedalBindings {
     pub throttle: Option<BindingView>,
     pub brake: Option<BindingView>,
+    pub steering: Option<BindingView>,
 }
 
 impl PedalBindings {
     #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
-        self.throttle.is_some() && self.brake.is_some()
+        self.throttle.is_some() && self.brake.is_some() && self.steering.is_some()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LiveSample {
+    pub throttle: f32,
+    pub brake: f32,
+    pub steering: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,22 +220,26 @@ pub enum WizardStepView {
         device: Option<DeviceSnapshot>,
         bindings: PedalBindings,
         values: Vec<(InputRole, f32)>,
-        history: Vec<(f32, f32)>,
+        history: Vec<LiveSample>,
     },
 }
 
 impl WizardStepView {
     pub fn title(&self) -> &'static str {
         match self {
-            WizardStepView::SelectDevice { .. } => "Step 1/3: Choose device",
+            WizardStepView::SelectDevice { .. } => "Step 1/4: Choose device",
             WizardStepView::Capture {
                 role: InputRole::Throttle,
                 ..
-            } => "Step 2/3: Detect throttle",
+            } => "Step 2/4: Detect throttle",
             WizardStepView::Capture {
                 role: InputRole::Brake,
                 ..
-            } => "Step 3/3: Detect brake",
+            } => "Step 3/4: Detect brake",
+            WizardStepView::Capture {
+                role: InputRole::Steering,
+                ..
+            } => "Step 4/4: Detect steering",
             WizardStepView::Ready { .. } => "Configured",
         }
     }
@@ -182,19 +257,61 @@ struct CaptureCandidate {
     magnitude: f32,
 }
 
+#[derive(Clone, Debug)]
+struct SteeringCandidate {
+    axis_index: usize,
+    axis_label: &'static str,
+    raw: u32,
+    magnitude: f32,
+}
+
+#[derive(Clone, Debug)]
+struct SteeringEdge {
+    axis_index: usize,
+    axis_label: &'static str,
+    raw: u32,
+}
+
 enum CaptureUpdate {
     Waiting,
     Candidate(CaptureCandidate),
     Finished(BindingView),
 }
 
+enum SteeringCaptureUpdate {
+    Waiting,
+    Candidate(SteeringCandidate),
+    Finished(SteeringCandidate),
+}
+
+enum CaptureState {
+    Idle,
+    Detect {
+        baseline: Vec<u32>,
+        candidate: Option<CaptureCandidate>,
+    },
+    SteeringAdvancedLeft {
+        center: Vec<u32>,
+        candidate: Option<SteeringCandidate>,
+    },
+    SteeringAdvancedRight {
+        center: Vec<u32>,
+        left: SteeringEdge,
+        candidate: Option<SteeringCandidate>,
+    },
+}
+
+impl CaptureState {
+    fn is_armed(&self) -> bool {
+        !matches!(self, CaptureState::Idle)
+    }
+}
+
 enum WizardStep {
     SelectDevice,
     Capture {
         role: InputRole,
-        armed: bool,
-        baseline: Vec<u32>,
-        candidate: Option<CaptureCandidate>,
+        state: CaptureState,
     },
     Ready,
 }
@@ -203,6 +320,15 @@ const CAPTURE_START_THRESHOLD: f32 = 0.18;
 const CAPTURE_RELEASE_THRESHOLD: f32 = 0.06;
 
 fn capture_prompt(role: InputRole, advanced_calibration: bool) -> String {
+    if role == InputRole::Steering {
+        return if advanced_calibration {
+            "Center captured. Turn steering fully left, then release it back to center.".to_string()
+        } else {
+            "Turn Steering right once, then release it. The driver range is used for full travel."
+                .to_string()
+        };
+    }
+
     if advanced_calibration {
         format!(
             "Press {} fully, then release it. This saves an advanced custom 0-100% range.",
@@ -217,6 +343,14 @@ fn capture_prompt(role: InputRole, advanced_calibration: bool) -> String {
 }
 
 fn capture_detected_prompt(role: InputRole, advanced_calibration: bool) -> String {
+    if role == InputRole::Steering {
+        return if advanced_calibration {
+            "Steering movement detected. Release back to center to save this side.".to_string()
+        } else {
+            "Steering movement detected. Release back to center to save the binding.".to_string()
+        };
+    }
+
     if advanced_calibration {
         format!(
             "{} movement detected. Release the pedal to save the custom range.",
@@ -237,7 +371,7 @@ pub struct Wizard<P: DeviceProvider> {
     active_device: Option<DeviceSnapshot>,
     step: WizardStep,
     bindings: PedalBindings,
-    value_history: Vec<(f32, f32)>,
+    value_history: Vec<LiveSample>,
     status: String,
     tick: u32,
     advanced_calibration: bool,
@@ -281,22 +415,73 @@ impl<P: DeviceProvider> Wizard<P> {
             self.record_live_values();
         }
 
-        if let WizardStep::Capture {
-            role,
-            armed: true,
-            baseline,
-            candidate,
-        } = &self.step
-        {
-            let role = *role;
-            let baseline = baseline.clone();
-            let candidate = candidate.clone();
+        enum PendingUpdate {
+            Detect {
+                role: InputRole,
+                baseline: Vec<u32>,
+                candidate: Option<CaptureCandidate>,
+            },
+            SteeringLeft {
+                center: Vec<u32>,
+                candidate: Option<SteeringCandidate>,
+            },
+            SteeringRight {
+                center: Vec<u32>,
+                left: SteeringEdge,
+                candidate: Option<SteeringCandidate>,
+            },
+        }
 
-            match self.update_capture(role, &baseline, candidate.as_ref()) {
+        let pending = match &self.step {
+            WizardStep::Capture {
+                role,
+                state:
+                    CaptureState::Detect {
+                        baseline,
+                        candidate,
+                    },
+            } => Some(PendingUpdate::Detect {
+                role: *role,
+                baseline: baseline.clone(),
+                candidate: candidate.clone(),
+            }),
+            WizardStep::Capture {
+                state: CaptureState::SteeringAdvancedLeft { center, candidate },
+                ..
+            } => Some(PendingUpdate::SteeringLeft {
+                center: center.clone(),
+                candidate: candidate.clone(),
+            }),
+            WizardStep::Capture {
+                state:
+                    CaptureState::SteeringAdvancedRight {
+                        center,
+                        left,
+                        candidate,
+                    },
+                ..
+            } => Some(PendingUpdate::SteeringRight {
+                center: center.clone(),
+                left: left.clone(),
+                candidate: candidate.clone(),
+            }),
+            _ => None,
+        };
+
+        match pending {
+            Some(PendingUpdate::Detect {
+                role,
+                baseline,
+                candidate,
+            }) => match self.update_capture(role, &baseline, candidate.as_ref()) {
                 CaptureUpdate::Waiting => {}
                 CaptureUpdate::Candidate(candidate) => {
                     if let WizardStep::Capture {
-                        candidate: current, ..
+                        state:
+                            CaptureState::Detect {
+                                candidate: current, ..
+                            },
+                        ..
                     } = &mut self.step
                     {
                         *current = Some(candidate);
@@ -306,7 +491,79 @@ impl<P: DeviceProvider> Wizard<P> {
                 CaptureUpdate::Finished(binding) => {
                     self.finish_binding(binding);
                 }
+            },
+            Some(PendingUpdate::SteeringLeft { center, candidate }) => {
+                match self.update_steering_edge_capture(&center, None, candidate.as_ref()) {
+                    SteeringCaptureUpdate::Waiting => {}
+                    SteeringCaptureUpdate::Candidate(candidate) => {
+                        if let WizardStep::Capture {
+                            state:
+                                CaptureState::SteeringAdvancedLeft {
+                                    candidate: current, ..
+                                },
+                            ..
+                        } = &mut self.step
+                        {
+                            *current = Some(candidate);
+                        }
+                        self.status =
+                            "Left steering movement detected. Release back to center.".to_string();
+                    }
+                    SteeringCaptureUpdate::Finished(candidate) => {
+                        let left = SteeringEdge {
+                            axis_index: candidate.axis_index,
+                            axis_label: candidate.axis_label,
+                            raw: candidate.raw,
+                        };
+                        if let WizardStep::Capture { state, .. } = &mut self.step {
+                            *state = CaptureState::SteeringAdvancedRight {
+                                center,
+                                left,
+                                candidate: None,
+                            };
+                        }
+                        self.status =
+                            "Left range saved. Turn steering fully right, then release to center."
+                                .to_string();
+                    }
+                }
             }
+            Some(PendingUpdate::SteeringRight {
+                center,
+                left,
+                candidate,
+            }) => {
+                match self.update_steering_edge_capture(
+                    &center,
+                    Some(left.axis_index),
+                    candidate.as_ref(),
+                ) {
+                    SteeringCaptureUpdate::Waiting => {}
+                    SteeringCaptureUpdate::Candidate(candidate) => {
+                        if let WizardStep::Capture {
+                            state:
+                                CaptureState::SteeringAdvancedRight {
+                                    candidate: current, ..
+                                },
+                            ..
+                        } = &mut self.step
+                        {
+                            *current = Some(candidate);
+                        }
+                        self.status =
+                            "Right steering movement detected. Release back to center.".to_string();
+                    }
+                    SteeringCaptureUpdate::Finished(candidate) => {
+                        let right = SteeringEdge {
+                            axis_index: candidate.axis_index,
+                            axis_label: candidate.axis_label,
+                            raw: candidate.raw,
+                        };
+                        self.finish_advanced_steering(center, left, right);
+                    }
+                }
+            }
+            None => {}
         }
     }
 
@@ -330,9 +587,9 @@ impl<P: DeviceProvider> Wizard<P> {
                 devices: self.devices.clone(),
                 selected_index: self.selected_index,
             },
-            WizardStep::Capture { role, armed, .. } => WizardStepView::Capture {
+            WizardStep::Capture { role, state } => WizardStepView::Capture {
                 role: *role,
-                armed: *armed,
+                armed: state.is_armed(),
                 advanced_calibration: self.advanced_calibration,
                 device: self.active_device.clone(),
                 bindings: self.bindings.clone(),
@@ -378,6 +635,16 @@ impl<P: DeviceProvider> Wizard<P> {
             self.status = "Saved profile found, but brake binding is invalid.".to_string();
             return false;
         };
+        let steering = if let Some(stored) = &profile.steering {
+            let Some(steering) = Self::binding_from_profile(InputRole::Steering, stored, &device)
+            else {
+                self.status = "Saved profile found, but steering binding is invalid.".to_string();
+                return false;
+            };
+            Some(steering)
+        } else {
+            None
+        };
 
         self.selected_index = index;
         self.active_device = Some(device);
@@ -389,10 +656,20 @@ impl<P: DeviceProvider> Wizard<P> {
         self.bindings = PedalBindings {
             throttle: Some(throttle),
             brake: Some(brake),
+            steering,
         };
         self.value_history.clear();
-        self.step = WizardStep::Ready;
-        self.status = "Saved profile loaded. Overlay input is ready.".to_string();
+        if self.bindings.steering.is_some() {
+            self.step = WizardStep::Ready;
+            self.status = "Saved profile loaded. Overlay input is ready.".to_string();
+        } else {
+            self.step = WizardStep::Capture {
+                role: InputRole::Steering,
+                state: CaptureState::Idle,
+            };
+            self.status =
+                "Saved pedals loaded. Center steering, then click Capture steering.".to_string();
+        }
         true
     }
 
@@ -400,22 +677,26 @@ impl<P: DeviceProvider> Wizard<P> {
         let device = self.active_device.as_ref()?;
         let throttle = self.bindings.throttle.as_ref()?;
         let brake = self.bindings.brake.as_ref()?;
+        let steering = self.bindings.steering.as_ref()?;
 
         Some(StoredProfile {
             device_id: device.id,
             device_name: device.name.clone(),
             throttle: Self::binding_to_profile(throttle),
             brake: Self::binding_to_profile(brake),
+            steering: Some(Self::binding_to_profile(steering)),
+            overlay_settings: Default::default(),
         })
     }
 
     fn confirm(&mut self) {
-        match self.step {
+        match &self.step {
             WizardStep::SelectDevice => self.choose_selected_device(),
-            WizardStep::Capture { armed: false, .. } => self.arm_capture(),
             WizardStep::Capture {
-                armed: true, role, ..
-            } => {
+                state: CaptureState::Idle,
+                ..
+            } => self.arm_capture(),
+            WizardStep::Capture { role, .. } => {
                 self.status = format!("Still waiting for {} movement.", role.label());
             }
             WizardStep::Ready => {}
@@ -432,12 +713,21 @@ impl<P: DeviceProvider> Wizard<P> {
     }
 
     fn toggle_advanced_calibration(&mut self) {
-        let WizardStep::Capture { armed: false, .. } = self.step else {
+        let WizardStep::Capture {
+            role,
+            state: CaptureState::Idle,
+        } = self.step
+        else {
             return;
         };
 
         self.advanced_calibration = !self.advanced_calibration;
-        self.status = if self.advanced_calibration {
+        self.status = if role == InputRole::Steering && self.advanced_calibration {
+            "Advanced calibration enabled. Steering will capture center, left, and right."
+                .to_string()
+        } else if role == InputRole::Steering {
+            "Advanced calibration disabled. Driver range will be used for steering.".to_string()
+        } else if self.advanced_calibration {
             "Advanced calibration enabled. Capture will save a custom 0-100% range.".to_string()
         } else {
             "Advanced calibration disabled. Driver range will be used for 0-100%.".to_string()
@@ -492,9 +782,7 @@ impl<P: DeviceProvider> Wizard<P> {
         self.advanced_calibration = false;
         self.step = WizardStep::Capture {
             role: InputRole::Throttle,
-            armed: false,
-            baseline: Vec::new(),
-            candidate: None,
+            state: CaptureState::Idle,
         };
         self.status = "Release all pedals, then click Capture throttle.".to_string();
     }
@@ -508,12 +796,18 @@ impl<P: DeviceProvider> Wizard<P> {
 
         if let WizardStep::Capture { role, .. } = self.step {
             let baseline = device.axes.iter().map(|axis| axis.raw).collect();
-            self.step = WizardStep::Capture {
-                role,
-                armed: true,
-                baseline,
-                candidate: None,
+            let state = if role == InputRole::Steering && self.advanced_calibration {
+                CaptureState::SteeringAdvancedLeft {
+                    center: baseline,
+                    candidate: None,
+                }
+            } else {
+                CaptureState::Detect {
+                    baseline,
+                    candidate: None,
+                }
             };
+            self.step = WizardStep::Capture { role, state };
             self.status = capture_prompt(role, self.advanced_calibration);
         }
     }
@@ -611,26 +905,154 @@ impl<P: DeviceProvider> Wizard<P> {
         (axis.raw as f32 - idle_raw as f32).abs() / range
     }
 
+    fn update_steering_edge_capture(
+        &self,
+        center: &[u32],
+        required_axis: Option<usize>,
+        candidate: Option<&SteeringCandidate>,
+    ) -> SteeringCaptureUpdate {
+        let Some((next, magnitude)) = self.detect_steering_candidate(center, required_axis) else {
+            return if let Some(candidate) = candidate {
+                if self.current_release_magnitude(candidate.axis_index, center)
+                    <= CAPTURE_RELEASE_THRESHOLD
+                {
+                    SteeringCaptureUpdate::Finished(candidate.clone())
+                } else {
+                    SteeringCaptureUpdate::Candidate(candidate.clone())
+                }
+            } else {
+                SteeringCaptureUpdate::Waiting
+            };
+        };
+
+        if let Some(candidate) = candidate {
+            if magnitude <= CAPTURE_RELEASE_THRESHOLD {
+                return SteeringCaptureUpdate::Finished(candidate.clone());
+            }
+
+            if magnitude <= candidate.magnitude {
+                return SteeringCaptureUpdate::Candidate(candidate.clone());
+            }
+        }
+
+        SteeringCaptureUpdate::Candidate(next)
+    }
+
+    fn detect_steering_candidate(
+        &self,
+        center: &[u32],
+        required_axis: Option<usize>,
+    ) -> Option<(SteeringCandidate, f32)> {
+        let device = self.active_device.as_ref()?;
+        let mut best: Option<(usize, f32)> = None;
+
+        for (index, axis) in device.axes.iter().enumerate() {
+            if required_axis.is_some_and(|required| required != index) {
+                continue;
+            }
+            let Some(&center_raw) = center.get(index) else {
+                continue;
+            };
+            let range = axis.max.saturating_sub(axis.min).max(1) as f32;
+            let magnitude = (axis.raw as f32 - center_raw as f32).abs() / range;
+
+            if magnitude > best.map(|(_, value)| value).unwrap_or(0.0) {
+                best = Some((index, magnitude));
+            }
+        }
+
+        let (axis_index, magnitude) = best?;
+        if magnitude < CAPTURE_START_THRESHOLD {
+            return None;
+        }
+
+        let axis = &device.axes[axis_index];
+        Some((
+            SteeringCandidate {
+                axis_index,
+                axis_label: axis.label,
+                raw: axis.raw,
+                magnitude,
+            },
+            magnitude,
+        ))
+    }
+
     fn finish_binding(&mut self, binding: BindingView) {
         match binding.role {
             InputRole::Throttle => {
                 self.bindings.throttle = Some(binding);
                 self.step = WizardStep::Capture {
                     role: InputRole::Brake,
-                    armed: false,
-                    baseline: Vec::new(),
-                    candidate: None,
+                    state: CaptureState::Idle,
                 };
                 self.status =
                     "Throttle detected. Release all pedals, then click Capture brake.".to_string();
             }
             InputRole::Brake => {
                 self.bindings.brake = Some(binding);
+                self.step = WizardStep::Capture {
+                    role: InputRole::Steering,
+                    state: CaptureState::Idle,
+                };
+                self.status =
+                    "Brake detected. Center steering, then click Capture steering.".to_string();
+            }
+            InputRole::Steering => {
+                self.bindings.steering = Some(binding);
                 self.step = WizardStep::Ready;
                 self.value_history.clear();
-                self.status = "Pedal inputs are configured. Overlay input is ready.".to_string();
+                self.status =
+                    "Pedal and steering inputs are configured. Overlay input is ready.".to_string();
             }
         }
+    }
+
+    fn finish_advanced_steering(
+        &mut self,
+        center: Vec<u32>,
+        left: SteeringEdge,
+        right: SteeringEdge,
+    ) {
+        let Some(&center_raw) = center.get(left.axis_index) else {
+            self.reset_steering_capture("Steering center sample was invalid. Try capture again.");
+            return;
+        };
+        if left.axis_index != right.axis_index
+            || !Self::valid_steering_range(center_raw, left.raw, right.raw)
+        {
+            self.reset_steering_capture(
+                "Steering range was invalid. Center the wheel and capture steering again.",
+            );
+            return;
+        }
+
+        self.finish_binding(BindingView {
+            role: InputRole::Steering,
+            axis_index: left.axis_index,
+            axis_label: left.axis_label,
+            idle_raw: center_raw,
+            active_raw: right.raw,
+            calibration: BindingCalibration::SteeringCustomRange {
+                center_raw,
+                left_raw: left.raw,
+                right_raw: right.raw,
+            },
+        });
+    }
+
+    fn reset_steering_capture(&mut self, status: &str) {
+        self.bindings.steering = None;
+        self.step = WizardStep::Capture {
+            role: InputRole::Steering,
+            state: CaptureState::Idle,
+        };
+        self.status = status.to_string();
+    }
+
+    fn valid_steering_range(center_raw: u32, left_raw: u32, right_raw: u32) -> bool {
+        (left_raw < center_raw && center_raw < right_raw)
+            || (right_raw < center_raw && center_raw < left_raw)
     }
 
     fn live_values(&self) -> Vec<(InputRole, f32)> {
@@ -644,6 +1066,9 @@ impl<P: DeviceProvider> Wizard<P> {
         }
         if let Some(binding) = &self.bindings.brake {
             values.push((InputRole::Brake, binding.value(&device.axes)));
+        }
+        if let Some(binding) = &self.bindings.steering {
+            values.push((InputRole::Steering, binding.value(&device.axes)));
         }
         values
     }
@@ -705,6 +1130,18 @@ impl<P: DeviceProvider> Wizard<P> {
                 active_raw: *active_raw,
             }),
             StoredCalibration::CustomRange { .. } => None,
+            StoredCalibration::SteeringCustomRange {
+                center_raw,
+                left_raw,
+                right_raw,
+            } if Self::valid_steering_range(*center_raw, *left_raw, *right_raw) => {
+                Some(BindingCalibration::SteeringCustomRange {
+                    center_raw: *center_raw,
+                    left_raw: *left_raw,
+                    right_raw: *right_raw,
+                })
+            }
+            StoredCalibration::SteeringCustomRange { .. } => None,
         }
     }
 
@@ -717,6 +1154,15 @@ impl<P: DeviceProvider> Wizard<P> {
             } => StoredCalibration::CustomRange {
                 idle_raw: *idle_raw,
                 active_raw: *active_raw,
+            },
+            BindingCalibration::SteeringCustomRange {
+                center_raw,
+                left_raw,
+                right_raw,
+            } => StoredCalibration::SteeringCustomRange {
+                center_raw: *center_raw,
+                left_raw: *left_raw,
+                right_raw: *right_raw,
             },
         }
     }
@@ -731,8 +1177,16 @@ impl<P: DeviceProvider> Wizard<P> {
             .iter()
             .find_map(|(role, value)| (*role == InputRole::Brake).then_some(*value))
             .unwrap_or(0.0);
+        let steering = values
+            .iter()
+            .find_map(|(role, value)| (*role == InputRole::Steering).then_some(*value))
+            .unwrap_or(0.0);
 
-        self.value_history.push((throttle, brake));
+        self.value_history.push(LiveSample {
+            throttle,
+            brake,
+            steering,
+        });
         if self.value_history.len() > 180 {
             self.value_history.remove(0);
         }
@@ -836,6 +1290,14 @@ mod tests {
                 active_raw: 0,
                 calibration: StoredCalibration::DriverRange,
             },
+            steering: Some(StoredBinding {
+                axis_index: 0,
+                axis_label: "X".to_string(),
+                idle_raw: 500,
+                active_raw: 1000,
+                calibration: StoredCalibration::DriverRange,
+            }),
+            overlay_settings: Default::default(),
         }
     }
 
@@ -884,6 +1346,61 @@ mod tests {
     }
 
     #[test]
+    fn steering_driver_range_maps_full_axis() {
+        let binding = BindingView {
+            role: InputRole::Steering,
+            axis_index: 0,
+            axis_label: "X",
+            idle_raw: 500,
+            active_raw: 700,
+            calibration: BindingCalibration::DriverRange,
+        };
+
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 0)]), -1.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 500)]), 0.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 1000)]), 1.0);
+    }
+
+    #[test]
+    fn steering_driver_range_supports_reversed_direction() {
+        let binding = BindingView {
+            role: InputRole::Steering,
+            axis_index: 0,
+            axis_label: "X",
+            idle_raw: 500,
+            active_raw: 300,
+            calibration: BindingCalibration::DriverRange,
+        };
+
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 0)]), 1.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 500)]), 0.0);
+        assert_near(
+            binding.value(&[AxisSnapshot::new("X", 0, 1000, 1000)]),
+            -1.0,
+        );
+    }
+
+    #[test]
+    fn steering_advanced_calibration_maps_center_left_and_right() {
+        let binding = BindingView {
+            role: InputRole::Steering,
+            axis_index: 0,
+            axis_label: "X",
+            idle_raw: 500,
+            active_raw: 900,
+            calibration: BindingCalibration::SteeringCustomRange {
+                center_raw: 500,
+                left_raw: 100,
+                right_raw: 900,
+            },
+        };
+
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 100)]), -1.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 500)]), 0.0);
+        assert_near(binding.value(&[AxisSnapshot::new("X", 0, 1000, 900)]), 1.0);
+    }
+
+    #[test]
     fn wizard_reports_empty_device_list() {
         let wizard = Wizard::new(TestProvider::new(Vec::new(), &[]));
         let view = wizard.view();
@@ -897,21 +1414,30 @@ mod tests {
 
     #[test]
     fn capture_flow_uses_driver_range_not_capture_peak() {
-        let provider = TestProvider::new(vec![test_device(7, "Test Pedals", &[0, 0])], &[0, 0]);
+        let provider = TestProvider::new(
+            vec![test_device(7, "Test Pedals", &[0, 0, 500])],
+            &[0, 0, 500],
+        );
         let mut wizard = Wizard::new(provider.clone());
 
         wizard.handle_command(WizardCommand::Confirm);
         wizard.handle_command(WizardCommand::Confirm);
 
-        provider.set_axes(&[620, 35]);
+        provider.set_axes(&[620, 35, 500]);
         wizard.update();
-        provider.set_axes(&[0, 0]);
+        provider.set_axes(&[0, 0, 500]);
         wizard.update();
 
         wizard.handle_command(WizardCommand::Confirm);
-        provider.set_axes(&[20, 760]);
+        provider.set_axes(&[20, 760, 500]);
         wizard.update();
-        provider.set_axes(&[0, 0]);
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 0, 700]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
         wizard.update();
 
         let profile = wizard.profile().unwrap();
@@ -921,8 +1447,12 @@ mod tests {
         assert_eq!(profile.brake.axis_index, 1);
         assert_eq!(profile.brake.idle_raw, 0);
         assert_eq!(profile.brake.active_raw, 760);
+        let steering = profile.steering.unwrap();
+        assert_eq!(steering.axis_index, 2);
+        assert_eq!(steering.idle_raw, 500);
+        assert_eq!(steering.active_raw, 700);
 
-        provider.set_axes(&[620, 760]);
+        provider.set_axes(&[620, 760, 700]);
         wizard.update();
 
         match wizard.view().step {
@@ -931,20 +1461,23 @@ mod tests {
             } => {
                 assert_near(value_for(&values, InputRole::Throttle), 0.62);
                 assert_near(value_for(&values, InputRole::Brake), 0.76);
+                assert_near(value_for(&values, InputRole::Steering), 0.4);
                 assert_eq!(history.len(), 1);
-                assert_near(history[0].0, 0.62);
-                assert_near(history[0].1, 0.76);
+                assert_near(history[0].throttle, 0.62);
+                assert_near(history[0].brake, 0.76);
+                assert_near(history[0].steering, 0.4);
             }
             _ => panic!("expected ready state"),
         }
 
-        provider.set_axes(&[1000, 1000]);
+        provider.set_axes(&[1000, 1000, 1000]);
         wizard.update();
 
         match wizard.view().step {
             WizardStepView::Ready { values, .. } => {
                 assert_near(value_for(&values, InputRole::Throttle), 1.0);
                 assert_near(value_for(&values, InputRole::Brake), 1.0);
+                assert_near(value_for(&values, InputRole::Steering), 1.0);
             }
             _ => panic!("expected ready state"),
         }
@@ -952,7 +1485,10 @@ mod tests {
 
     #[test]
     fn advanced_calibration_saves_custom_range() {
-        let provider = TestProvider::new(vec![test_device(7, "Test Pedals", &[0, 0])], &[0, 0]);
+        let provider = TestProvider::new(
+            vec![test_device(7, "Test Pedals", &[0, 0, 500])],
+            &[0, 0, 500],
+        );
         let mut wizard = Wizard::new(provider.clone());
 
         wizard.handle_command(WizardCommand::Confirm);
@@ -966,15 +1502,25 @@ mod tests {
         }
 
         wizard.handle_command(WizardCommand::Confirm);
-        provider.set_axes(&[600, 0]);
+        provider.set_axes(&[600, 0, 500]);
         wizard.update();
-        provider.set_axes(&[0, 0]);
+        provider.set_axes(&[0, 0, 500]);
         wizard.update();
 
         wizard.handle_command(WizardCommand::Confirm);
-        provider.set_axes(&[0, 800]);
+        provider.set_axes(&[0, 800, 500]);
         wizard.update();
-        provider.set_axes(&[0, 0]);
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 0, 100]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 900]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
         wizard.update();
 
         let profile = wizard.profile().unwrap();
@@ -992,14 +1538,60 @@ mod tests {
                 active_raw: 800
             }
         );
+        assert_eq!(
+            profile.steering.unwrap().calibration,
+            StoredCalibration::SteeringCustomRange {
+                center_raw: 500,
+                left_raw: 100,
+                right_raw: 900
+            }
+        );
 
-        provider.set_axes(&[300, 400]);
+        provider.set_axes(&[300, 400, 700]);
         wizard.update();
 
         match wizard.view().step {
             WizardStepView::Ready { values, .. } => {
                 assert_near(value_for(&values, InputRole::Throttle), 0.5);
                 assert_near(value_for(&values, InputRole::Brake), 0.5);
+                assert_near(value_for(&values, InputRole::Steering), 0.5);
+            }
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn normal_steering_capture_detects_reversed_direction() {
+        let provider = TestProvider::new(
+            vec![test_device(7, "Test Pedals", &[0, 0, 500])],
+            &[0, 0, 500],
+        );
+        let mut wizard = Wizard::new(provider.clone());
+
+        wizard.handle_command(WizardCommand::Confirm);
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[600, 0, 500]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 700, 500]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 0, 300]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        provider.set_axes(&[0, 0, 0]);
+        wizard.update();
+        match wizard.view().step {
+            WizardStepView::Ready { values, .. } => {
+                assert_near(value_for(&values, InputRole::Steering), 1.0);
             }
             _ => panic!("expected ready state"),
         }
@@ -1039,6 +1631,28 @@ mod tests {
             }
             _ => panic!("expected ready state"),
         }
+    }
+
+    #[test]
+    fn restore_old_profile_without_steering_lands_on_steering_capture() {
+        let provider =
+            TestProvider::new(vec![test_device(7, "Saved Pedals", &[0, 0])], &[500, 250]);
+        let mut wizard = Wizard::new(provider);
+        let mut profile = profile_for(7, "Saved Pedals");
+        profile.steering = None;
+
+        assert!(wizard.restore_profile(&profile));
+
+        match wizard.view().step {
+            WizardStepView::Capture { role, bindings, .. } => {
+                assert_eq!(role, InputRole::Steering);
+                assert!(bindings.throttle.is_some());
+                assert!(bindings.brake.is_some());
+                assert!(bindings.steering.is_none());
+            }
+            _ => panic!("expected steering capture state"),
+        }
+        assert!(wizard.profile().is_none());
     }
 
     #[test]
