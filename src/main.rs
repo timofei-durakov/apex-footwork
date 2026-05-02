@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod alerts;
+mod notifications;
 mod profile;
 mod wizard;
 
-use alerts::{AlertSensitivity, AlertSettings, AlertSeverity, AlertView, LIVE_SAMPLE_INTERVAL_MS};
+use alerts::{AlertSensitivity, AlertSettings, AlertView, LIVE_SAMPLE_INTERVAL_MS};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -50,7 +51,6 @@ const JOY_RETURNALL: Dword = JOY_RETURNX
 
 const APP_ICON_RESOURCE_ID: usize = 1;
 const UI_TIMER_INTERVAL_MS: Uint = LIVE_SAMPLE_INTERVAL_MS as Uint;
-const MAX_VISIBLE_ALERTS: usize = 2;
 const WM_CREATE: Uint = 0x0001;
 const WM_DESTROY: Uint = 0x0002;
 const WM_PAINT: Uint = 0x000F;
@@ -69,6 +69,7 @@ const VK_CONTROL: i32 = 0x11;
 const KEY_O: Wparam = 0x4F;
 const KEY_R: Wparam = 0x52;
 const SW_HIDE: i32 = 0;
+const SW_SHOWNOACTIVATE: i32 = 4;
 const SW_SHOW: i32 = 5;
 const CS_HREDRAW: Uint = 0x0002;
 const CS_VREDRAW: Uint = 0x0001;
@@ -106,8 +107,10 @@ const DEFAULT_PITCH: Dword = 0;
 const PS_SOLID: i32 = 0;
 const HTCAPTION: Wparam = 2;
 const WS_EX_TOPMOST: Dword = 0x0000_0008;
+const WS_EX_TRANSPARENT: Dword = 0x0000_0020;
 const WS_EX_TOOLWINDOW: Dword = 0x0000_0080;
 const WS_EX_LAYERED: Dword = 0x0008_0000;
+const WS_EX_NOACTIVATE: Dword = 0x0800_0000;
 const LWA_ALPHA: Dword = 0x0000_0002;
 const ERROR_SUCCESS: i32 = 0;
 const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as Hkey;
@@ -382,6 +385,7 @@ static SAVED_PROFILE_SIGNATURE: OnceLock<Mutex<Option<String>>> = OnceLock::new(
 static OVERLAY_SETTINGS: OnceLock<Mutex<OverlaySettings>> = OnceLock::new();
 static RESIZE_DRAG: OnceLock<Mutex<Option<ResizeDrag>>> = OnceLock::new();
 static OVERLAY_HWND: OnceLock<Mutex<Hwnd>> = OnceLock::new();
+static ALERT_NOTIFICATION_HWND: OnceLock<Mutex<Hwnd>> = OnceLock::new();
 static DEVICE_DROPDOWN_OPEN: OnceLock<Mutex<bool>> = OnceLock::new();
 
 struct UiFonts {
@@ -438,6 +442,7 @@ struct OverlayLayout {
     steering_chart: Option<Rect>,
     opacity_minus: Rect,
     opacity_plus: Rect,
+    alerts_toggle: Rect,
     steering_toggle: Rect,
     sensitivity_toggle: Rect,
 }
@@ -469,6 +474,7 @@ fn main() {
     OVERLAY_SETTINGS.get_or_init(|| Mutex::new(OverlaySettings::default()));
     RESIZE_DRAG.get_or_init(|| Mutex::new(None));
     OVERLAY_HWND.get_or_init(|| Mutex::new(0));
+    ALERT_NOTIFICATION_HWND.get_or_init(|| Mutex::new(0));
     DEVICE_DROPDOWN_OPEN.get_or_init(|| Mutex::new(false));
 
     let mut wizard = Wizard::new(WinmmDeviceProvider);
@@ -486,6 +492,7 @@ fn main() {
 unsafe fn run_window() {
     let class_name = wide("ApexFootworkWindow");
     let overlay_class_name = wide("ApexFootworkOverlayWindow");
+    let notification_class_name = wide("ApexFootworkAlertNotificationWindow");
     let title = wide("Apex Footwork");
     let h_instance = unsafe { GetModuleHandleW(null()) };
     let cursor = unsafe { LoadCursorW(0, 32512usize as *const u16) };
@@ -518,6 +525,19 @@ unsafe fn run_window() {
         lpsz_class_name: overlay_class_name.as_ptr(),
     };
     unsafe { RegisterClassW(&overlay_wc) };
+    let notification_wc = WndClassW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfn_wnd_proc: Some(alert_notification_window_proc),
+        cb_cls_extra: 0,
+        cb_wnd_extra: 0,
+        h_instance,
+        h_icon: icon,
+        h_cursor: cursor,
+        hbr_background: 0,
+        lpsz_menu_name: null(),
+        lpsz_class_name: notification_class_name.as_ptr(),
+    };
+    unsafe { RegisterClassW(&notification_wc) };
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -569,6 +589,7 @@ unsafe extern "system" fn window_proc(
         WM_ERASEBKGND => 1,
         WM_TIMER => {
             with_wizard(|wizard| wizard.update());
+            sync_alert_notification_window();
             sync_controls();
             unsafe { InvalidateRect(hwnd, null(), 0) };
             0
@@ -618,6 +639,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             close_overlay_window();
+            close_alert_notification_window();
             unsafe { PostQuitMessage(0) };
             0
         }
@@ -664,6 +686,22 @@ unsafe extern "system" fn overlay_window_proc(
         }
         WM_DESTROY => {
             set_overlay_hwnd(0);
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+unsafe extern "system" fn alert_notification_window_proc(
+    hwnd: Hwnd,
+    msg: Uint,
+    wparam: Wparam,
+    lparam: Lparam,
+) -> Lresult {
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_DESTROY => {
+            set_alert_notification_hwnd(0);
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -748,6 +786,107 @@ fn close_overlay_window() {
             DestroyWindow(hwnd);
         }
     }
+    close_alert_notification_window();
+}
+
+fn start_alert_notification_window() -> Option<Hwnd> {
+    if let Some(hwnd) = active_alert_notification_hwnd() {
+        return Some(hwnd);
+    }
+
+    let class_name = wide("ApexFootworkAlertNotificationWindow");
+    let title = wide("Apex Footwork alert notification");
+    let h_instance = unsafe { GetModuleHandleW(null()) };
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            class_name.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            h_instance,
+            null_mut(),
+        )
+    };
+
+    if hwnd == 0 {
+        return None;
+    }
+    set_alert_notification_hwnd(hwnd);
+    Some(hwnd)
+}
+
+fn active_alert_notification_hwnd() -> Option<Hwnd> {
+    let hwnd = ALERT_NOTIFICATION_HWND
+        .get_or_init(|| Mutex::new(0))
+        .lock()
+        .map(|notification| *notification)
+        .unwrap_or(0);
+    (hwnd != 0).then_some(hwnd)
+}
+
+fn set_alert_notification_hwnd(hwnd: Hwnd) {
+    if let Ok(mut notification) = ALERT_NOTIFICATION_HWND.get_or_init(|| Mutex::new(0)).lock() {
+        *notification = hwnd;
+    }
+}
+
+fn take_alert_notification_hwnd() -> Hwnd {
+    let Ok(mut notification) = ALERT_NOTIFICATION_HWND.get_or_init(|| Mutex::new(0)).lock() else {
+        return 0;
+    };
+    let hwnd = *notification;
+    *notification = 0;
+    hwnd
+}
+
+fn hide_alert_notification_window() {
+    if let Some(hwnd) = active_alert_notification_hwnd() {
+        unsafe { ShowWindow(hwnd, SW_HIDE) };
+    }
+}
+
+fn close_alert_notification_window() {
+    notifications::reset_presentation();
+    let hwnd = take_alert_notification_hwnd();
+    if hwnd != 0 {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+    }
+}
+
+fn sync_alert_notification_window() {
+    let overlay_active = active_overlay_hwnd().is_some();
+    let alerts_enabled = overlay_settings().alert_settings.enabled;
+    if !should_show_alert_notification(is_ready_view(), alerts_enabled, overlay_active) {
+        notifications::reset_presentation();
+        hide_alert_notification_window();
+        return;
+    }
+
+    let alerts = current_alerts();
+    let Some(frame) = notifications::next_frame(&alerts, LIVE_SAMPLE_INTERVAL_MS) else {
+        hide_alert_notification_window();
+        return;
+    };
+    let Some(hwnd) = start_alert_notification_window() else {
+        return;
+    };
+    if notifications::render_frame(hwnd, active_overlay_hwnd(), frame) {
+        unsafe {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+fn should_show_alert_notification(ready: bool, alerts_enabled: bool, overlay_active: bool) -> bool {
+    ready && alerts_enabled && overlay_active
 }
 
 fn overlay_window_size() -> (i32, i32) {
@@ -795,6 +934,7 @@ fn handle_shortcut_key(key: Wparam) -> bool {
         KEY_O => toggle_overlay_window(),
         KEY_R => {
             close_overlay_window();
+            close_alert_notification_window();
             with_wizard(|wizard| wizard.handle_command(WizardCommand::Configure));
             true
         }
@@ -1059,6 +1199,14 @@ fn handle_overlay_settings_click(client: Rect, x: i32, y: i32) -> bool {
         save_current_profile();
         return true;
     }
+    if point_in_rect(x, y, layout.alerts_toggle) {
+        settings.alert_settings.enabled = !settings.alert_settings.enabled;
+        let alert_settings = settings.alert_settings;
+        drop(settings);
+        with_wizard(|wizard| wizard.set_alert_settings(alert_settings));
+        sync_alert_notification_window();
+        return true;
+    }
     if point_in_rect(x, y, layout.steering_toggle) {
         settings.show_steering_graph = !settings.show_steering_graph;
         drop(settings);
@@ -1083,6 +1231,15 @@ fn is_ready_view() -> bool {
     current_view()
         .map(|view| matches!(view.step, WizardStepView::Ready { .. }))
         .unwrap_or(false)
+}
+
+fn current_alerts() -> Vec<AlertView> {
+    current_view()
+        .and_then(|view| match view.step {
+            WizardStepView::Ready { alerts, .. } => Some(alerts),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn with_wizard(action: impl FnOnce(&mut Wizard<WinmmDeviceProvider>)) {
@@ -1735,17 +1892,13 @@ fn draw_overlay_scene(hdc: Hdc, rect: Rect) {
         return;
     };
 
-    if let WizardStepView::Ready {
-        history, alerts, ..
-    } = &view.step
-    {
+    if let WizardStepView::Ready { history, .. } = &view.step {
         let settings = overlay_settings();
         let (pedal_chart, steering_chart) = split_history_charts(rect, settings);
         draw_combined_overlay_chart(hdc, pedal_chart, history, 1.0, false);
         if let Some(steering_chart) = steering_chart {
             draw_steering_trace(hdc, steering_chart, history, settings.steering_scale, 1.0);
         }
-        draw_alert_stack(hdc, pedal_chart, alerts, 1.0);
     } else {
         draw_text_kind(
             hdc,
@@ -2113,9 +2266,9 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
             bindings,
             values,
             history,
-            alerts,
+            ..
         } => {
-            draw_ready(hdc, rect, device, bindings, values, history, alerts);
+            draw_ready(hdc, rect, device, bindings, values, history);
         }
     }
 
@@ -2484,7 +2637,6 @@ fn draw_ready(
     _bindings: &PedalBindings,
     values: &[(InputRole, f32)],
     history: &[LiveSample],
-    alerts: &[AlertView],
 ) {
     let device_name = device
         .as_ref()
@@ -2542,7 +2694,6 @@ fn draw_ready(
         );
     }
     draw_resize_grip(hdc, layout.chart_area, settings.chart_opacity);
-    draw_alert_stack(hdc, layout.chart, alerts, settings.chart_opacity);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32, width: i32) {
@@ -2585,17 +2736,20 @@ fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32, widt
 fn draw_overlay_controls(hdc: Hdc, layout: OverlayLayout, settings: OverlaySettings) {
     let y = layout.controls_y;
     let opacity_label_left = layout.opacity_minus.left - 104;
-    let resize_width = (opacity_label_left - layout.content_left - 12).clamp(80, 220);
-    draw_text_kind(
-        hdc,
-        layout.content_left,
-        y + 5,
-        resize_width,
-        20,
-        "Resize graph by dragging its corner",
-        TextKind::Meta,
-        color_muted(),
-    );
+    let resize_text_left = layout.alerts_toggle.right + 12;
+    let resize_width = (opacity_label_left - resize_text_left - 12).clamp(0, 220);
+    if resize_width >= 96 {
+        draw_text_kind(
+            hdc,
+            resize_text_left,
+            y + 5,
+            resize_width,
+            20,
+            "Drag graph corner to resize",
+            TextKind::Meta,
+            color_muted(),
+        );
+    }
 
     draw_text_kind(
         hdc,
@@ -2612,6 +2766,12 @@ fn draw_overlay_controls(hdc: Hdc, layout: OverlayLayout, settings: OverlaySetti
 
     draw_checkbox(
         hdc,
+        layout.alerts_toggle,
+        "Sticker alerts",
+        settings.alert_settings.enabled,
+    );
+    draw_checkbox(
+        hdc,
         layout.steering_toggle,
         "Steering graph",
         settings.show_steering_graph,
@@ -2622,83 +2782,6 @@ fn draw_overlay_controls(hdc: Hdc, layout: OverlayLayout, settings: OverlaySetti
         "Sensitive steering",
         settings.steering_scale == SteeringGraphScale::Log,
     );
-}
-
-fn draw_alert_stack(hdc: Hdc, chart: Rect, alerts: &[AlertView], opacity: f32) {
-    for (alert, chip) in alerts
-        .iter()
-        .take(MAX_VISIBLE_ALERTS)
-        .zip(alert_chip_rects(chart, alerts.len()))
-    {
-        let alert_opacity = (opacity * alert.opacity).clamp(0.0, 1.0);
-        let color = alert_severity_color(alert.severity);
-        let fill = blend_colors(color_app_bg(), color, 0.22 * alert_opacity);
-        let border = blend_colors(color_app_bg(), color, alert_opacity);
-        let text_color = blend_colors(color_app_bg(), color_text(), alert_opacity);
-        draw_panel_with_border(
-            hdc,
-            chip.left,
-            chip.top,
-            chip.right - chip.left,
-            chip.bottom - chip.top,
-            fill,
-            border,
-        );
-
-        fill_rect(
-            hdc,
-            rect_xywh(chip.left + 8, chip.top + 8, 3, chip.bottom - chip.top - 16),
-            border,
-        );
-
-        let label = if chip.right - chip.left >= 210 {
-            format!("{}: {}", alert.label, alert.message)
-        } else {
-            alert.label.to_string()
-        };
-        draw_text_kind(
-            hdc,
-            chip.left + 18,
-            chip.top + 5,
-            chip.right - chip.left - 26,
-            18,
-            &label,
-            TextKind::Meta,
-            text_color,
-        );
-    }
-}
-
-fn alert_chip_rects(chart: Rect, alert_count: usize) -> Vec<Rect> {
-    let count = alert_count.min(MAX_VISIBLE_ALERTS);
-    let width = chart.right - chart.left;
-    let height = chart.bottom - chart.top;
-    if count == 0 || width < 120 || height < 32 {
-        return Vec::new();
-    }
-
-    let chip_width = (width - 24).clamp(96, 240);
-    let chip_height = 28;
-    let gap = 6;
-    let max_count = ((height - 20 + gap) / (chip_height + gap)).clamp(0, count as i32) as usize;
-
-    (0..max_count)
-        .map(|index| {
-            rect_xywh(
-                chart.left + 12,
-                chart.top + 10 + index as i32 * (chip_height + gap),
-                chip_width,
-                chip_height,
-            )
-        })
-        .collect()
-}
-
-fn alert_severity_color(severity: AlertSeverity) -> Dword {
-    match severity {
-        AlertSeverity::Notice => rgb(255, 198, 92),
-        AlertSeverity::Warning => rgb(255, 82, 96),
-    }
 }
 
 fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
@@ -2727,6 +2810,8 @@ fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
         .max(content_left + 74);
     let opacity_plus = rect_xywh(opacity_plus_left, controls_y, 34, 28);
     let opacity_minus = rect_xywh(opacity_plus.left - 40, controls_y, 34, 28);
+    let alerts_toggle_width = (content_width / 3).clamp(112, 150);
+    let alerts_toggle = rect_xywh(content_left, controls_y, alerts_toggle_width, 28);
     let row2_y = controls_y + 34;
     let steering_toggle_width = (content_width / 2 - 8).clamp(112, 168);
     let steering_toggle = rect_xywh(content_left, row2_y, steering_toggle_width, 28);
@@ -2750,6 +2835,7 @@ fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
         steering_chart,
         opacity_minus,
         opacity_plus,
+        alerts_toggle,
         steering_toggle,
         sensitivity_toggle,
     }
@@ -3368,12 +3454,14 @@ mod tests {
             for control in [
                 layout.opacity_minus,
                 layout.opacity_plus,
+                layout.alerts_toggle,
                 layout.steering_toggle,
                 layout.sensitivity_toggle,
             ] {
                 assert_inside(control, content);
             }
             assert!(!intersects(layout.opacity_minus, layout.opacity_plus));
+            assert!(!intersects(layout.alerts_toggle, layout.opacity_minus));
             assert!(!intersects(
                 layout.steering_toggle,
                 layout.sensitivity_toggle
@@ -3382,24 +3470,11 @@ mod tests {
     }
 
     #[test]
-    fn alert_chips_stay_inside_pedal_chart() {
-        for width in [260, 348, 640, 900] {
-            let chart_area = rect_xywh(0, 0, width, 120);
-            let (pedal_chart, steering_chart) =
-                split_history_charts(chart_area, OverlaySettings::default());
-            let chips = alert_chip_rects(pedal_chart, 4);
-
-            assert!(chips.len() <= MAX_VISIBLE_ALERTS);
-            for chip in &chips {
-                assert_inside(*chip, pedal_chart);
-                if let Some(steering_chart) = steering_chart {
-                    assert!(!intersects(*chip, steering_chart));
-                }
-            }
-            if chips.len() == 2 {
-                assert!(!intersects(chips[0], chips[1]));
-            }
-        }
+    fn sticker_alerts_require_ready_enabled_and_active_overlay() {
+        assert!(should_show_alert_notification(true, true, true));
+        assert!(!should_show_alert_notification(false, true, true));
+        assert!(!should_show_alert_notification(true, false, true));
+        assert!(!should_show_alert_notification(true, true, false));
     }
 
     #[test]

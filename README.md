@@ -24,7 +24,7 @@ Windows SmartScreen, antivirus software, or browser download protection may warn
 - Restores the saved profile on startup when the device is connected.
 - Provides a movable overlay with live throttle/brake bars, a pedal history graph, and an optional vertical steering trace.
 - Includes overlay controls for steering graph visibility and sensitive steering display.
-- Shows coaching alerts for pedal overlap, coasting, throttle application with steering lock, abrupt brake release, steering oscillation, and excessive steering lock.
+- Shows central sticker coaching alerts for pedal overlap, coasting, throttle application with steering lock, abrupt brake release, steering oscillation, and excessive steering lock.
 - Embeds the project icon into the app binary, installer, uninstaller, and Start Menu shortcuts.
 
 ## Usage
@@ -46,17 +46,19 @@ Overlay controls:
 
 - `Steering graph`: show or hide the vertical steering history graph.
 - `Sensitive steering`: use a log-style display scale that makes smaller steering movements easier to see. This changes only the graph display, not the saved binding or raw input mapping.
+- `Sticker alerts`: show or hide the separate central sticker alert layer.
 - `Opacity`: adjust graph opacity.
 
 ## Overlay alerts
 
 Overlay alerts are lightweight coaching hints based only on throttle, brake, and steering input. They do not use game telemetry such as speed, gear, ABS, TC, tire slip, or car state, so treat them as technique prompts rather than absolute driving truth.
 
-The default alert sensitivity is `balanced`. Internally the alert engine also supports `quiet` and `sensitive` presets. Alert chips appear over the pedal history graph, with at most two visible at once.
+The default alert sensitivity is `balanced`. Internally the alert engine also supports `quiet` and `sensitive` presets. Alert stickers appear in a separate click-through notification layer centered on the overlay monitor, with only the highest-priority active alert visible.
 
 `Pedal overlap`
 
 - Chip: `Throttle + brake`
+- Sticker: colliding pedals forming a bold X.
 - Severity: warning
 - Balanced trigger: throttle > 12% and brake > 12% for more than 160 ms.
 - Quiet trigger: throttle > 16% and brake > 16% for more than 240 ms.
@@ -66,6 +68,7 @@ The default alert sensitivity is `balanced`. Internally the alert engine also su
 `Coasting`
 
 - Chip: `Coasting`
+- Sticker: hollow load marker and empty footprint.
 - Severity: notice
 - Balanced trigger: throttle < 4%, brake < 4%, and steering > 12% for more than 350 ms.
 - Quiet trigger: throttle < 3%, brake < 3%, and steering > 16% for more than 500 ms.
@@ -75,6 +78,7 @@ The default alert sensitivity is `balanced`. Internally the alert engine also su
 `Throttle with lock`
 
 - Chip: `Unwind first`
+- Sticker: steering lock with a throttle wedge.
 - Severity: warning
 - Balanced trigger: steering > 45%, current throttle >= 28%, and throttle rises by at least 22% over roughly 160 ms.
 - Quiet trigger: steering > 55%, current throttle >= 34%, and throttle rises by at least 30% over roughly 160 ms.
@@ -84,6 +88,7 @@ The default alert sensitivity is `balanced`. Internally the alert engine also su
 `Brake release snap`
 
 - Chip: `Ease release`
+- Sticker: brake pedal with a lightning snap.
 - Severity: warning
 - Balanced trigger: steering > 20%, brake was >= 35% roughly 160 ms ago, and brake drops by at least 28%.
 - Quiet trigger: steering > 28%, brake was >= 45% roughly 160 ms ago, and brake drops by at least 36%.
@@ -93,6 +98,7 @@ The default alert sensitivity is `balanced`. Internally the alert engine also su
 `Steering saw`
 
 - Chip: `Sawing wheel`
+- Sticker: steering wheel with a jagged correction wave.
 - Severity: notice
 - Balanced trigger: at least 3 steering direction changes in roughly 640 ms, each counted movement >= 8%, with at least 16% total steering range.
 - Quiet trigger: at least 4 direction changes, each counted movement >= 10%, with at least 24% total steering range.
@@ -102,6 +108,7 @@ The default alert sensitivity is `balanced`. Internally the alert engine also su
 `Steering saturated`
 
 - Chip: `Too much lock`
+- Sticker: steering wheel pressed into side stops.
 - Severity: warning
 - Balanced trigger: steering > 92% and throttle or brake > 8% for more than 350 ms.
 - Quiet trigger: steering > 96% and throttle or brake > 12% for more than 500 ms.
@@ -175,10 +182,13 @@ apex-footwork.ico              Application and installer icon
 build.rs                       Windows resource embedding for the app binary
 src\main.rs                    Win32 UI, overlay, device polling, app entry point
 src\alerts.rs                  Overlay alert detection engine and alert presets
+src\notifications.rs           Central sticker alert presentation and rendering
 src\wizard.rs                  Device selection and pedal capture workflow
 src\profile.rs                 Saved profile serialization and loading
+assets\alert_stickers\*.png    Transparent sticker alert artwork
 installer\apex-footwork.nsi    NSIS installer script
 scripts\build-installer.ps1    Release and installer build script
+scripts\generate_alert_stickers.ps1  Sticker artwork generator
 ```
 
 ## Release notes

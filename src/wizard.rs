@@ -618,6 +618,10 @@ impl<P: DeviceProvider> Wizard<P> {
         self.bindings.is_complete().then(|| self.bindings.clone())
     }
 
+    pub fn set_alert_settings(&mut self, settings: AlertSettings) {
+        self.alert_engine.set_settings(settings);
+    }
+
     pub fn restore_profile(&mut self, profile: &StoredProfile) -> bool {
         self.alert_engine
             .set_settings(alert_settings_from_profile(profile));
