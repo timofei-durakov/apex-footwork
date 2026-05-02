@@ -320,6 +320,22 @@ enum WizardStep {
 
 const CAPTURE_START_THRESHOLD: f32 = 0.18;
 const CAPTURE_RELEASE_THRESHOLD: f32 = 0.06;
+const STEERING_CAPTURE_START_THRESHOLD: f32 = 0.05;
+const STEERING_RELEASE_THRESHOLD: f32 = 0.02;
+
+fn capture_start_threshold(role: InputRole) -> f32 {
+    match role {
+        InputRole::Steering => STEERING_CAPTURE_START_THRESHOLD,
+        InputRole::Throttle | InputRole::Brake => CAPTURE_START_THRESHOLD,
+    }
+}
+
+fn capture_release_threshold(role: InputRole) -> f32 {
+    match role {
+        InputRole::Steering => STEERING_RELEASE_THRESHOLD,
+        InputRole::Throttle | InputRole::Brake => CAPTURE_RELEASE_THRESHOLD,
+    }
+}
 
 fn capture_prompt(role: InputRole, advanced_calibration: bool) -> String {
     if role == InputRole::Steering {
@@ -830,10 +846,11 @@ impl<P: DeviceProvider> Wizard<P> {
         baseline: &[u32],
         candidate: Option<&CaptureCandidate>,
     ) -> CaptureUpdate {
+        let release_threshold = capture_release_threshold(role);
         let Some((binding, magnitude)) = self.detect_binding(role, baseline) else {
             return if let Some(candidate) = candidate {
                 if self.current_release_magnitude(candidate.binding.axis_index, baseline)
-                    <= CAPTURE_RELEASE_THRESHOLD
+                    <= release_threshold
                 {
                     CaptureUpdate::Finished(candidate.binding.clone())
                 } else {
@@ -845,7 +862,7 @@ impl<P: DeviceProvider> Wizard<P> {
         };
 
         if let Some(candidate) = candidate {
-            if magnitude <= CAPTURE_RELEASE_THRESHOLD {
+            if magnitude <= release_threshold {
                 return CaptureUpdate::Finished(candidate.binding.clone());
             }
 
@@ -875,7 +892,7 @@ impl<P: DeviceProvider> Wizard<P> {
         }
 
         let (axis_index, magnitude) = best?;
-        if magnitude < CAPTURE_START_THRESHOLD {
+        if magnitude < capture_start_threshold(role) {
             return None;
         }
 
@@ -1625,6 +1642,45 @@ mod tests {
             }
             _ => panic!("expected ready state"),
         }
+    }
+
+    #[test]
+    fn normal_steering_capture_starts_at_five_percent_movement() {
+        let provider = TestProvider::new(
+            vec![test_device(7, "Test Pedals", &[0, 0, 500])],
+            &[0, 0, 500],
+        );
+        let mut wizard = Wizard::new(provider.clone());
+
+        wizard.handle_command(WizardCommand::Confirm);
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[600, 0, 500]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 700, 500]);
+        wizard.update();
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        wizard.handle_command(WizardCommand::Confirm);
+        provider.set_axes(&[0, 0, 550]);
+        wizard.update();
+        match wizard.view().step {
+            WizardStepView::Capture { armed, .. } => assert!(armed),
+            _ => panic!("expected capture state before steering release"),
+        }
+
+        provider.set_axes(&[0, 0, 500]);
+        wizard.update();
+
+        let profile = wizard.profile().unwrap();
+        let steering = profile.steering.unwrap();
+        assert_eq!(steering.axis_index, 2);
+        assert_eq!(steering.idle_raw, 500);
+        assert_eq!(steering.active_raw, 550);
     }
 
     #[test]
