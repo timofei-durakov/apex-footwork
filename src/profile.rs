@@ -41,6 +41,8 @@ pub enum StoredCalibration {
 pub struct StoredOverlaySettings {
     pub steering_graph: bool,
     pub steering_scale: StoredSteeringScale,
+    pub alerts_enabled: bool,
+    pub alert_sensitivity: StoredAlertSensitivity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,11 +51,20 @@ pub enum StoredSteeringScale {
     Log,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredAlertSensitivity {
+    Quiet,
+    Balanced,
+    Sensitive,
+}
+
 impl Default for StoredOverlaySettings {
     fn default() -> Self {
         Self {
             steering_graph: true,
             steering_scale: StoredSteeringScale::Log,
+            alerts_enabled: true,
+            alert_sensitivity: StoredAlertSensitivity::Balanced,
         }
     }
 }
@@ -104,6 +115,18 @@ fn serialize_profile(profile: &StoredProfile) -> String {
         match profile.overlay_settings.steering_scale {
             StoredSteeringScale::Linear => "linear",
             StoredSteeringScale::Log => "log",
+        }
+    ));
+    lines.push(format!(
+        "overlay_alerts={}",
+        profile.overlay_settings.alerts_enabled
+    ));
+    lines.push(format!(
+        "overlay_alert_sensitivity={}",
+        match profile.overlay_settings.alert_sensitivity {
+            StoredAlertSensitivity::Quiet => "quiet",
+            StoredAlertSensitivity::Balanced => "balanced",
+            StoredAlertSensitivity::Sensitive => "sensitive",
         }
     ));
     lines.join("\n")
@@ -249,10 +272,25 @@ fn parse_overlay_settings(values: &HashMap<String, String>) -> Option<StoredOver
         Some(_) => return None,
         None => StoredOverlaySettings::default().steering_scale,
     };
+    let alerts_enabled = match values.get("overlay_alerts").map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        Some(_) => return None,
+        None => StoredOverlaySettings::default().alerts_enabled,
+    };
+    let alert_sensitivity = match values.get("overlay_alert_sensitivity").map(String::as_str) {
+        Some("quiet") => StoredAlertSensitivity::Quiet,
+        Some("balanced") => StoredAlertSensitivity::Balanced,
+        Some("sensitive") => StoredAlertSensitivity::Sensitive,
+        Some(_) => return None,
+        None => StoredOverlaySettings::default().alert_sensitivity,
+    };
 
     Some(StoredOverlaySettings {
         steering_graph,
         steering_scale,
+        alerts_enabled,
+        alert_sensitivity,
     })
 }
 
@@ -321,6 +359,8 @@ mod tests {
             overlay_settings: StoredOverlaySettings {
                 steering_graph: false,
                 steering_scale: StoredSteeringScale::Linear,
+                alerts_enabled: false,
+                alert_sensitivity: StoredAlertSensitivity::Sensitive,
             },
         }
     }
@@ -383,6 +423,27 @@ mod tests {
 
         assert_eq!(profile.steering, None);
         assert_eq!(profile.overlay_settings, StoredOverlaySettings::default());
+    }
+
+    #[test]
+    fn parser_defaults_missing_alert_settings() {
+        let content = serialize_profile(&sample_profile())
+            .lines()
+            .filter(|line| !line.starts_with("overlay_alert"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let profile = parse_profile(&content).unwrap();
+
+        assert_eq!(profile.overlay_settings.alerts_enabled, true);
+        assert_eq!(
+            profile.overlay_settings.alert_sensitivity,
+            StoredAlertSensitivity::Balanced
+        );
+        assert_eq!(profile.overlay_settings.steering_graph, false);
+        assert_eq!(
+            profile.overlay_settings.steering_scale,
+            StoredSteeringScale::Linear
+        );
     }
 
     #[test]

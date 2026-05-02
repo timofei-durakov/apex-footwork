@@ -1,3 +1,4 @@
+use crate::alerts::{AlertEngine, AlertSensitivity, AlertSettings, AlertView};
 use crate::profile::{StoredBinding, StoredCalibration, StoredProfile};
 
 #[derive(Clone, Debug)]
@@ -221,6 +222,7 @@ pub enum WizardStepView {
         bindings: PedalBindings,
         values: Vec<(InputRole, f32)>,
         history: Vec<LiveSample>,
+        alerts: Vec<AlertView>,
     },
 }
 
@@ -372,6 +374,7 @@ pub struct Wizard<P: DeviceProvider> {
     step: WizardStep,
     bindings: PedalBindings,
     value_history: Vec<LiveSample>,
+    alert_engine: AlertEngine,
     status: String,
     tick: u32,
     advanced_calibration: bool,
@@ -394,6 +397,7 @@ impl<P: DeviceProvider> Wizard<P> {
             step: WizardStep::SelectDevice,
             bindings: PedalBindings::default(),
             value_history: Vec::new(),
+            alert_engine: AlertEngine::default(),
             status,
             tick: 0,
             advanced_calibration: false,
@@ -599,6 +603,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 bindings: self.bindings.clone(),
                 values: self.live_values(),
                 history: self.value_history.clone(),
+                alerts: self.alert_engine.alerts().to_vec(),
             },
         };
 
@@ -614,6 +619,8 @@ impl<P: DeviceProvider> Wizard<P> {
     }
 
     pub fn restore_profile(&mut self, profile: &StoredProfile) -> bool {
+        self.alert_engine
+            .set_settings(alert_settings_from_profile(profile));
         self.refresh_devices();
 
         let Some(index) = self.matching_device_index(profile) else {
@@ -658,7 +665,7 @@ impl<P: DeviceProvider> Wizard<P> {
             brake: Some(brake),
             steering,
         };
-        self.value_history.clear();
+        self.clear_live_state();
         if self.bindings.steering.is_some() {
             self.step = WizardStep::Ready;
             self.status = "Saved profile loaded. Overlay input is ready.".to_string();
@@ -706,7 +713,7 @@ impl<P: DeviceProvider> Wizard<P> {
     fn configure(&mut self) {
         self.active_device = None;
         self.bindings = PedalBindings::default();
-        self.value_history.clear();
+        self.clear_live_state();
         self.advanced_calibration = false;
         self.step = WizardStep::SelectDevice;
         self.refresh_devices();
@@ -762,6 +769,7 @@ impl<P: DeviceProvider> Wizard<P> {
                 self.active_device = None;
                 self.bindings = PedalBindings::default();
                 self.step = WizardStep::SelectDevice;
+                self.clear_live_state();
                 self.refresh_devices();
                 self.status =
                     "Lost selected device. Choose it again after reconnecting.".to_string();
@@ -778,7 +786,7 @@ impl<P: DeviceProvider> Wizard<P> {
         self.active_device = Some(device);
         self.poll_active_device();
         self.bindings = PedalBindings::default();
-        self.value_history.clear();
+        self.clear_live_state();
         self.advanced_calibration = false;
         self.step = WizardStep::Capture {
             role: InputRole::Throttle,
@@ -1001,7 +1009,7 @@ impl<P: DeviceProvider> Wizard<P> {
             InputRole::Steering => {
                 self.bindings.steering = Some(binding);
                 self.step = WizardStep::Ready;
-                self.value_history.clear();
+                self.clear_live_state();
                 self.status =
                     "Pedal and steering inputs are configured. Overlay input is ready.".to_string();
             }
@@ -1190,12 +1198,30 @@ impl<P: DeviceProvider> Wizard<P> {
         if self.value_history.len() > 180 {
             self.value_history.remove(0);
         }
+        self.alert_engine.update(&self.value_history);
+    }
+
+    fn clear_live_state(&mut self) {
+        self.value_history.clear();
+        self.alert_engine.clear();
+    }
+}
+
+fn alert_settings_from_profile(profile: &StoredProfile) -> AlertSettings {
+    AlertSettings {
+        enabled: profile.overlay_settings.alerts_enabled,
+        sensitivity: match profile.overlay_settings.alert_sensitivity {
+            crate::profile::StoredAlertSensitivity::Quiet => AlertSensitivity::Quiet,
+            crate::profile::StoredAlertSensitivity::Balanced => AlertSensitivity::Balanced,
+            crate::profile::StoredAlertSensitivity::Sensitive => AlertSensitivity::Sensitive,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alerts::AlertId;
     use crate::profile::{StoredBinding, StoredProfile};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1702,6 +1728,50 @@ mod tests {
 
         match wizard.view().step {
             WizardStepView::Ready { history, .. } => assert_eq!(history.len(), 180),
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn ready_view_reports_alerts_from_live_history() {
+        let provider = TestProvider::new(
+            vec![test_device(6, "Alert Pedals", &[0, 0, 500])],
+            &[0, 0, 500],
+        );
+        let mut wizard = Wizard::new(provider.clone());
+
+        assert!(wizard.restore_profile(&profile_for(6, "Alert Pedals")));
+        for _ in 0..20 {
+            provider.set_axes(&[200, 200, 500]);
+            wizard.update();
+        }
+
+        match wizard.view().step {
+            WizardStepView::Ready { alerts, .. } => {
+                assert!(alerts.iter().any(|alert| alert.id == AlertId::PedalOverlap))
+            }
+            _ => panic!("expected ready state"),
+        }
+    }
+
+    #[test]
+    fn alert_settings_disable_ready_alerts() {
+        let provider = TestProvider::new(
+            vec![test_device(6, "Alert Pedals", &[0, 0, 500])],
+            &[0, 0, 500],
+        );
+        let mut wizard = Wizard::new(provider.clone());
+        let mut profile = profile_for(6, "Alert Pedals");
+        profile.overlay_settings.alerts_enabled = false;
+
+        assert!(wizard.restore_profile(&profile));
+        for _ in 0..20 {
+            provider.set_axes(&[200, 200, 500]);
+            wizard.update();
+        }
+
+        match wizard.view().step {
+            WizardStepView::Ready { alerts, .. } => assert!(alerts.is_empty()),
             _ => panic!("expected ready state"),
         }
     }

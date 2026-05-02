@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod alerts;
 mod profile;
 mod wizard;
 
+use alerts::{AlertSensitivity, AlertSettings, AlertSeverity, AlertView, LIVE_SAMPLE_INTERVAL_MS};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -47,6 +49,8 @@ const JOY_RETURNALL: Dword = JOY_RETURNX
     | JOY_RETURNBUTTONS;
 
 const APP_ICON_RESOURCE_ID: usize = 1;
+const UI_TIMER_INTERVAL_MS: Uint = LIVE_SAMPLE_INTERVAL_MS as Uint;
+const MAX_VISIBLE_ALERTS: usize = 2;
 const WM_CREATE: Uint = 0x0001;
 const WM_DESTROY: Uint = 0x0002;
 const WM_PAINT: Uint = 0x000F;
@@ -404,6 +408,7 @@ struct OverlaySettings {
     chart_opacity: f32,
     show_steering_graph: bool,
     steering_scale: SteeringGraphScale,
+    alert_settings: AlertSettings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -455,6 +460,7 @@ impl Default for OverlaySettings {
             chart_opacity: 0.9,
             show_steering_graph: true,
             steering_scale: SteeringGraphScale::Log,
+            alert_settings: AlertSettings::default(),
         }
     }
 }
@@ -556,7 +562,7 @@ unsafe extern "system" fn window_proc(
 ) -> Lresult {
     match msg {
         WM_CREATE => {
-            unsafe { SetTimer(hwnd, 1, 16, null()) };
+            unsafe { SetTimer(hwnd, 1, UI_TIMER_INTERVAL_MS, null()) };
             create_controls(hwnd);
             0
         }
@@ -627,7 +633,7 @@ unsafe extern "system" fn overlay_window_proc(
 ) -> Lresult {
     match msg {
         WM_CREATE => {
-            unsafe { SetTimer(hwnd, 2, 16, null()) };
+            unsafe { SetTimer(hwnd, 2, UI_TIMER_INTERVAL_MS, null()) };
             apply_overlay_window_opacity(hwnd);
             0
         }
@@ -1141,6 +1147,7 @@ fn apply_saved_overlay_settings(stored: &profile::StoredOverlaySettings) {
             profile::StoredSteeringScale::Linear => SteeringGraphScale::Linear,
             profile::StoredSteeringScale::Log => SteeringGraphScale::Log,
         };
+        settings.alert_settings = alert_settings_from_stored(stored);
     }
 }
 
@@ -1151,6 +1158,23 @@ fn stored_overlay_settings() -> profile::StoredOverlaySettings {
         steering_scale: match settings.steering_scale {
             SteeringGraphScale::Linear => profile::StoredSteeringScale::Linear,
             SteeringGraphScale::Log => profile::StoredSteeringScale::Log,
+        },
+        alerts_enabled: settings.alert_settings.enabled,
+        alert_sensitivity: match settings.alert_settings.sensitivity {
+            AlertSensitivity::Quiet => profile::StoredAlertSensitivity::Quiet,
+            AlertSensitivity::Balanced => profile::StoredAlertSensitivity::Balanced,
+            AlertSensitivity::Sensitive => profile::StoredAlertSensitivity::Sensitive,
+        },
+    }
+}
+
+fn alert_settings_from_stored(stored: &profile::StoredOverlaySettings) -> AlertSettings {
+    AlertSettings {
+        enabled: stored.alerts_enabled,
+        sensitivity: match stored.alert_sensitivity {
+            profile::StoredAlertSensitivity::Quiet => AlertSensitivity::Quiet,
+            profile::StoredAlertSensitivity::Balanced => AlertSensitivity::Balanced,
+            profile::StoredAlertSensitivity::Sensitive => AlertSensitivity::Sensitive,
         },
     }
 }
@@ -1711,13 +1735,17 @@ fn draw_overlay_scene(hdc: Hdc, rect: Rect) {
         return;
     };
 
-    if let WizardStepView::Ready { history, .. } = &view.step {
+    if let WizardStepView::Ready {
+        history, alerts, ..
+    } = &view.step
+    {
         let settings = overlay_settings();
         let (pedal_chart, steering_chart) = split_history_charts(rect, settings);
         draw_combined_overlay_chart(hdc, pedal_chart, history, 1.0, false);
         if let Some(steering_chart) = steering_chart {
             draw_steering_trace(hdc, steering_chart, history, settings.steering_scale, 1.0);
         }
+        draw_alert_stack(hdc, pedal_chart, alerts, 1.0);
     } else {
         draw_text_kind(
             hdc,
@@ -2085,8 +2113,9 @@ fn draw_view(hdc: Hdc, view: &WizardView, rect: Rect) {
             bindings,
             values,
             history,
+            alerts,
         } => {
-            draw_ready(hdc, rect, device, bindings, values, history);
+            draw_ready(hdc, rect, device, bindings, values, history, alerts);
         }
     }
 
@@ -2455,6 +2484,7 @@ fn draw_ready(
     _bindings: &PedalBindings,
     values: &[(InputRole, f32)],
     history: &[LiveSample],
+    alerts: &[AlertView],
 ) {
     let device_name = device
         .as_ref()
@@ -2512,6 +2542,7 @@ fn draw_ready(
         );
     }
     draw_resize_grip(hdc, layout.chart_area, settings.chart_opacity);
+    draw_alert_stack(hdc, layout.chart, alerts, settings.chart_opacity);
 }
 
 fn draw_binding_summary(hdc: Hdc, bindings: &PedalBindings, x: i32, y: i32, width: i32) {
@@ -2591,6 +2622,83 @@ fn draw_overlay_controls(hdc: Hdc, layout: OverlayLayout, settings: OverlaySetti
         "Sensitive steering",
         settings.steering_scale == SteeringGraphScale::Log,
     );
+}
+
+fn draw_alert_stack(hdc: Hdc, chart: Rect, alerts: &[AlertView], opacity: f32) {
+    for (alert, chip) in alerts
+        .iter()
+        .take(MAX_VISIBLE_ALERTS)
+        .zip(alert_chip_rects(chart, alerts.len()))
+    {
+        let alert_opacity = (opacity * alert.opacity).clamp(0.0, 1.0);
+        let color = alert_severity_color(alert.severity);
+        let fill = blend_colors(color_app_bg(), color, 0.22 * alert_opacity);
+        let border = blend_colors(color_app_bg(), color, alert_opacity);
+        let text_color = blend_colors(color_app_bg(), color_text(), alert_opacity);
+        draw_panel_with_border(
+            hdc,
+            chip.left,
+            chip.top,
+            chip.right - chip.left,
+            chip.bottom - chip.top,
+            fill,
+            border,
+        );
+
+        fill_rect(
+            hdc,
+            rect_xywh(chip.left + 8, chip.top + 8, 3, chip.bottom - chip.top - 16),
+            border,
+        );
+
+        let label = if chip.right - chip.left >= 210 {
+            format!("{}: {}", alert.label, alert.message)
+        } else {
+            alert.label.to_string()
+        };
+        draw_text_kind(
+            hdc,
+            chip.left + 18,
+            chip.top + 5,
+            chip.right - chip.left - 26,
+            18,
+            &label,
+            TextKind::Meta,
+            text_color,
+        );
+    }
+}
+
+fn alert_chip_rects(chart: Rect, alert_count: usize) -> Vec<Rect> {
+    let count = alert_count.min(MAX_VISIBLE_ALERTS);
+    let width = chart.right - chart.left;
+    let height = chart.bottom - chart.top;
+    if count == 0 || width < 120 || height < 32 {
+        return Vec::new();
+    }
+
+    let chip_width = (width - 24).clamp(96, 240);
+    let chip_height = 28;
+    let gap = 6;
+    let max_count = ((height - 20 + gap) / (chip_height + gap)).clamp(0, count as i32) as usize;
+
+    (0..max_count)
+        .map(|index| {
+            rect_xywh(
+                chart.left + 12,
+                chart.top + 10 + index as i32 * (chip_height + gap),
+                chip_width,
+                chip_height,
+            )
+        })
+        .collect()
+}
+
+fn alert_severity_color(severity: AlertSeverity) -> Dword {
+    match severity {
+        AlertSeverity::Notice => rgb(255, 198, 92),
+        AlertSeverity::Warning => rgb(255, 82, 96),
+    }
 }
 
 fn overlay_layout(client: Rect, settings: OverlaySettings) -> OverlayLayout {
@@ -3270,6 +3378,27 @@ mod tests {
                 layout.steering_toggle,
                 layout.sensitivity_toggle
             ));
+        }
+    }
+
+    #[test]
+    fn alert_chips_stay_inside_pedal_chart() {
+        for width in [260, 348, 640, 900] {
+            let chart_area = rect_xywh(0, 0, width, 120);
+            let (pedal_chart, steering_chart) =
+                split_history_charts(chart_area, OverlaySettings::default());
+            let chips = alert_chip_rects(pedal_chart, 4);
+
+            assert!(chips.len() <= MAX_VISIBLE_ALERTS);
+            for chip in &chips {
+                assert_inside(*chip, pedal_chart);
+                if let Some(steering_chart) = steering_chart {
+                    assert!(!intersects(*chip, steering_chart));
+                }
+            }
+            if chips.len() == 2 {
+                assert!(!intersects(chips[0], chips[1]));
+            }
         }
     }
 
