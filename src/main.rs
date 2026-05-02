@@ -112,6 +112,11 @@ const WS_EX_TOOLWINDOW: Dword = 0x0000_0080;
 const WS_EX_LAYERED: Dword = 0x0008_0000;
 const WS_EX_NOACTIVATE: Dword = 0x0800_0000;
 const LWA_ALPHA: Dword = 0x0000_0002;
+const HWND_TOPMOST: Hwnd = -1;
+const SWP_NOSIZE: Uint = 0x0001;
+const SWP_NOMOVE: Uint = 0x0002;
+const SWP_NOACTIVATE: Uint = 0x0010;
+const SWP_SHOWWINDOW: Uint = 0x0040;
 const ERROR_SUCCESS: i32 = 0;
 const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as Hkey;
 const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002u32 as Hkey;
@@ -263,6 +268,15 @@ unsafe extern "system" {
     fn SetCapture(hWnd: Hwnd) -> Hwnd;
     fn SetLayeredWindowAttributes(hwnd: Hwnd, crKey: Dword, bAlpha: u8, dwFlags: Dword) -> Bool;
     fn SetTimer(hWnd: Hwnd, nIDEvent: usize, uElapse: Uint, lpTimerFunc: *const c_void) -> usize;
+    fn SetWindowPos(
+        hWnd: Hwnd,
+        hWndInsertAfter: Hwnd,
+        X: i32,
+        Y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: Uint,
+    ) -> Bool;
     fn ShowWindow(hWnd: Hwnd, nCmdShow: i32) -> Bool;
     fn TranslateMessage(lpMsg: *const Msg) -> Bool;
     fn UpdateWindow(hWnd: Hwnd) -> Bool;
@@ -657,12 +671,14 @@ unsafe extern "system" fn overlay_window_proc(
         WM_CREATE => {
             unsafe { SetTimer(hwnd, 2, UI_TIMER_INTERVAL_MS, null()) };
             apply_overlay_window_opacity(hwnd);
+            keep_window_topmost(hwnd);
             0
         }
         WM_ERASEBKGND => 1,
         WM_TIMER => {
             with_wizard(|wizard| wizard.update());
             apply_overlay_window_opacity(hwnd);
+            keep_window_topmost(hwnd);
             unsafe { InvalidateRect(hwnd, null(), 0) };
             0
         }
@@ -716,6 +732,7 @@ fn start_overlay_window() {
     if let Some(hwnd) = active_overlay_hwnd() {
         unsafe {
             apply_overlay_window_opacity(hwnd);
+            keep_window_topmost(hwnd);
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
         }
@@ -750,6 +767,7 @@ fn start_overlay_window() {
     set_overlay_hwnd(hwnd);
     unsafe {
         apply_overlay_window_opacity(hwnd);
+        keep_window_topmost(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
@@ -880,8 +898,26 @@ fn sync_alert_notification_window() {
     };
     if notifications::render_frame(hwnd, active_overlay_hwnd(), frame) {
         unsafe {
+            keep_window_topmost(hwnd);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
+    }
+}
+
+fn keep_window_topmost(hwnd: Hwnd) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
 
